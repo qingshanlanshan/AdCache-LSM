@@ -3,7 +3,7 @@
 This repository contains the source code and experiment scripts for our paper:
 
 **AdCache: Adaptive Cache Management with Admission Control for LSM-tree Key-Value Stores**  
-(*Under Submission, 2025*)
+(*Under Submission)
 
 AdCache is a lightweight, reinforcement learning-based cache manager that dynamically partitions memory between block cache and range cache, while applying selective admission for both point lookups and scans in LSM-tree-based key-value stores.
 
