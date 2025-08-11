@@ -1,4 +1,5 @@
 #include <span>
+#include <atomic>
 
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
@@ -7,30 +8,30 @@
 using namespace std;
 size_t counter = 0;
 struct TestStats {
-  double OP_time = 0;
-  size_t OP_count = 0;
+  std::atomic<double> OP_time = 0;
+  std::atomic<size_t> OP_count = 0;
   // get
-  size_t n_get = 0;
-  size_t n_hit = 0;
-  double get_time = 0;
+  std::atomic<size_t> n_get = 0;
+  std::atomic<size_t> n_hit = 0;
+  std::atomic<double> get_time = 0;
   // scan
-  size_t n_scan = 0;
-  double scan_time = 0;
-  size_t scan_length = 0;
+  std::atomic<size_t> n_scan = 0;
+  std::atomic<double> scan_time = 0;
+  std::atomic<size_t> scan_length = 0;
   // range cache
-  size_t length_in_cache = 0;
-  double time_in_cache = 0;
-  size_t n_in_cache = 0;
-  size_t length_in_db = 0;
-  double time_in_db = 0;
-  size_t n_in_db = 0;
+  std::atomic<size_t> length_in_cache = 0;
+  std::atomic<double> time_in_cache = 0;
+  std::atomic<size_t> n_in_cache = 0;
+  std::atomic<size_t> length_in_db = 0;
+  std::atomic<double> time_in_db = 0;
+  std::atomic<size_t> n_in_db = 0;
   // put
-  size_t n_put = 0;
-  double put_time = 0;
+  std::atomic<size_t> n_put = 0;
+  std::atomic<double> put_time = 0;
   // block
-  size_t n_block_get = 0;
-  size_t n_block_hit = 0;
-  size_t n_block_miss = 0;
+  std::atomic<size_t> n_block_get = 0;
+  std::atomic<size_t> n_block_hit = 0;
+  std::atomic<size_t> n_block_miss = 0;
 
   void reset() {
     OP_time = 0;
@@ -60,7 +61,7 @@ struct TestStats {
   //     (1 + n_get + scan_length / 4 + n_scan * (n_levels + 1));
   // }
   double get_hitrate(int n_levels) {
-    return 1 - (double)n_block_miss /
+    return 1 - 1.0 * n_block_miss /
                    (1 + n_get + scan_length / 4 + n_scan * (n_levels + 1));
   }
 };

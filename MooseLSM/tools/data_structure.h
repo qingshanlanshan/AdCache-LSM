@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "tools/skiplist.h"
+#include "tools/cacheus_helper.h"
 
 using namespace std;
 
@@ -1421,3 +1422,64 @@ class RLCache : public RangeCache {
   size_t map_counter = 0;
 };
 #endif
+
+class RangeCache_Cacheus : public RangeCache {
+ public:
+  using Cache::put;
+  RangeCache_Cacheus(size_t cap) : RangeCache(cap), cacheus(cap, 100, Cacheus::Params()) {
+    name_ = "RangeCache_Cacheus";
+  }
+  ~RangeCache_Cacheus() {}
+  void put(std::string& key, std::string& value) override {
+    uint64_t key_int = std::stoull(key);
+    auto [status, evicted] = cacheus.request(key_int, req_id++);
+    if (status == CacheOp::INSERT && evicted.has_value()) {
+      auto evicted_key_str = std::to_string(evicted.value());
+      // pad to 16 digits
+      if (evicted_key_str.size() < 16) {
+        evicted_key_str.insert(0, 16 - evicted_key_str.size(), '0');
+      }
+      evict_queue.push(evicted_key_str);
+    }
+    RangeCache::put(key, value);
+    return;
+  }
+  void insert_range(vector<pair<string, string>>& range) override {
+    if (range.size() == 0)
+      return;
+
+    for (auto& p : range) {
+      uint64_t key_int = std::stoull(p.first);
+      auto [status, evicted] = cacheus.request(key_int, req_id++);
+      if (status == CacheOp::INSERT && evicted.has_value()) {
+        auto evicted_key_str = std::to_string(evicted.value());
+        // pad to 16 digits
+        if (evicted_key_str.size() < 16) {
+          evicted_key_str.insert(0, 16 - evicted_key_str.size(), '0');
+        }
+        evict_queue.push(evicted_key_str);
+      }
+    }
+
+    RangeCache::insert_range(range);
+  }
+
+  void evict() {
+    while (size > capacity)
+    {
+      if (!is_full)
+      {
+        is_full = true;
+        cout<<"warmup done"<<endl;
+      }
+      string node_key = evict_queue.front();
+      evict_queue.pop();
+      remove(node_key);
+      size--;
+    }
+  }
+private:
+  Cacheus cacheus;
+  std::queue<std::string> evict_queue;
+  uint64_t req_id = 0;
+};

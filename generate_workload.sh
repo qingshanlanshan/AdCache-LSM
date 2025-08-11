@@ -10,4 +10,4 @@ WORKLOAD=dynamic
 # WORKLOAD=dynamic1
 
 cd workload
-python3 workload_generator.py --config ${WORKLOAD}.cfg --prepare workload_datset_20g.dat --output ${WORKLOAD}_query.dat
+python3 workload_generator.py --file-num 16 --config workload_cfg/${WORKLOAD}.cfg --prepare-num 100000000 --output workload_query/${WORKLOAD}_query.dat

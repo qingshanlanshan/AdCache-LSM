@@ -30,17 +30,18 @@ def get_config(config_file: str) -> list[Workload]:
         print(f"Workload: {workload.num_queries} queries, {workload.read_ratio} read ratio, {workload.short_scan_ratio} short scan ratio, {workload.long_scan_ratio} long scan ratio")
     return res
 
-def get_db(db_file: str) -> list[str]:
-    with open(db_file, 'r') as f:
-        lines = f.readlines()
-    return [line.strip().split()[-1] for line in lines]
+def get_db(db_size: int) -> list[str]:
+    # key format: "000...0123", length = 16
+    db = [str(i).zfill(16) for i in range(db_size)]
+    print(f"Database size: {len(db)}")
+    print(f"First 10 keys: {db[:10]}")
+    return db
 
-def generate_workload(workload: Workload, db: list[str], output_file: str) -> None:
+def generate_workload(dist, workload: Workload, db: list[str], output_files: list[str]) -> None:
     queries = []
     
     # read
     num_read = int(workload.num_queries * workload.read_ratio)
-    dist = zipf.Zipf(db, 0.9)
     t = dist.sample(num_read)
     unique_keys = set()
     for i in t:
@@ -74,26 +75,36 @@ def generate_workload(workload: Workload, db: list[str], output_file: str) -> No
         
         
     random.shuffle(queries)
-    with open(output_file, 'a') as f:
-        for query in queries:
-            f.write(query + '\n')
+    # with open(output_file, 'a') as f:
+    #     for query in queries:
+    #         f.write(query + '\n')
+    files = [open(file, 'a') for file in output_files]
+    for i, query in enumerate(queries):
+        files[i % len(files)].write(query + '\n')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
-    parser.add_argument('--prepare', type=str, required=True)
+    parser.add_argument('--prepare-num', type=int, required=True, help='number of keys to prepare in the database')
     parser.add_argument('--output', type=str, required=True)
+    parser.add_argument('--file-num', type=int, default=1, help='queries are split into this many files')
     args = parser.parse_args()
     
     CONFIG_FILE = args.config
-    DB_FILE = args.prepare
+    DB_SIZE = args.prepare_num
     OUTPUT_FILE = args.output
     
+    files = [f"{OUTPUT_FILE}_{i}" for i in range(args.file_num)]
 
     workloads = get_config(CONFIG_FILE)
-    db = get_db(DB_FILE)
+    db = get_db(DB_SIZE)
+    with open(f"dataset_{DB_SIZE}_entries.dat", 'w') as f:
+        for key in db:
+            f.write("INSERT " + key + '\n')
     # if OUTPUT_FILE exists, clear it
-    with open(OUTPUT_FILE, 'w') as f:
-        pass
+    for output_file in files:
+        with open(output_file, 'w') as f:
+            pass
+    dist = zipf.Zipf(db, 0.9)
     for workload in workloads:
-        generate_workload(workload, db, OUTPUT_FILE)
+        generate_workload(dist, workload, db, files)

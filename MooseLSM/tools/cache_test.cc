@@ -20,16 +20,13 @@
 #include "util/string_util.h"
 
 #include "cache/heap_cache.h"
+#include <csignal>
 
 using std::string;
-#if 1
-DEFINE_string(level_capacities, "4194304,41943040,419430400,4194304000,41943040000", "Comma-separated list of level capacities");
-DEFINE_string(run_numbers, "1,1,1,1,1", "Comma-separated list of run numbers");
-#else
-DEFINE_string(level_capacities, "4194304,41943040,419430400,4194304000", "Comma-separated list of level capacities");
-DEFINE_string(run_numbers, "1,1,1,1", "Comma-separated list of run numbers");
-#endif
-DEFINE_string(compaction_style, "moose", "Compaction style");
+
+DEFINE_string(level_capacities, "4194304,41943040,419430400,4194304000,41943040000,419430400000", "Comma-separated list of level capacities");
+DEFINE_string(run_numbers, "1,1,1,1,1,1", "Comma-separated list of run numbers");
+DEFINE_string(compaction_style, "default", "Compaction style");
 DEFINE_int32(bpk, 10, "Bits per key for filter");
 DEFINE_int32(kvsize, 1024, "Size of key-value pair");
 DEFINE_string(workload, "prepare", "prepare or test");
@@ -37,8 +34,8 @@ DEFINE_string(path, "/tmp/db", "dbpath");
 DEFINE_string(workload_file, "workload", "workload file");
 DEFINE_int32(cache_size, 0, "Cache size");
 DEFINE_int32(sst_size, 4194304, "SST size");
-DEFINE_string(cache_style, "block",
-              "Cache style: LRU, ELRU, heap, range, RLCache, block, lecar");
+DEFINE_string(cache_style, "block", "Cache style: LRU, ELRU, heap, range, RLCache, block, lecar, cacheus");
+DEFINE_int32(worker_threads_num, 0, "Number of worker threads");
 
 // for learning
 std::random_device rd;
@@ -47,6 +44,7 @@ size_t max_possible_scan_len = 64;
 std::set<std::string> query_keys;
 std::map<std::string, size_t> str_to_param_idx;
 uint64_t db_size = 0;
+auto launch_time = chrono::steady_clock::now();
 
 inline std::string ItoaWithPadding(const uint64_t key, uint64_t size) {
   std::string key_str = std::to_string(key);
@@ -80,33 +78,6 @@ std::string random_value(const int len) {
 
   return tmp_s;
 }
-
-class FlushCountListener : public rocksdb::EventListener {
- public:
-  FlushCountListener() : out(nullptr) {}
-  explicit FlushCountListener(std::ofstream* o) : out(o) {}
-  void OnFlushBegin(rocksdb::DB* /*db*/,
-                    const rocksdb::FlushJobInfo& /*flush_job_info*/) override {
-    if (out) *out << "Flush begin" << std::endl;
-  }
-  void OnFlushCompleted(
-      rocksdb::DB* db,
-      const rocksdb::FlushJobInfo& /*flush_job_info*/) override {
-    if (out) *out << "Flush completed" << std::endl;
-  }
-  void OnCompactionBegin(rocksdb::DB* /*db*/,
-                         const rocksdb::CompactionJobInfo& /*ci*/) override {
-    if (out) *out << "Compaction begin" << std::endl;
-  }
-  void OnCompactionCompleted(
-      rocksdb::DB* db,
-      const rocksdb::CompactionJobInfo& /*compaction_job_info*/) override {
-    if (out) *out << "Compaction completed" << std::endl;
-  }
-
- private:
-  std::ofstream* out;
-};
 
 std::vector<Operation> get_operations_from_file(const std::string& file_path) {
   std::vector<Operation> operations;
@@ -352,13 +323,14 @@ void set_cache_capacity(RangeCache* cache, float ratio) {
 }
 
 
-void FileWorkload(rocksdb::DB* db, TestStats& stats, Cache* cache = nullptr, std::ofstream* out = nullptr) {
+void FileWorkload(rocksdb::DB* db, TestStats& stats, Cache* cache = nullptr, std::ofstream* out = nullptr, int file_idx = -1) {
   rocksdb::ReadOptions read_options;
   read_options.extern_options = new rocksdb::ExternOptions();
   read_options.extern_options->cache_style = FLAGS_cache_style;
   read_options.verify_checksums = false;
 
-  size_t window_size = (size_t)1e3;
+  size_t learning_window_size = (size_t)1e3;
+  size_t print_window_size = (size_t)1e3;
   LearningStatistics learning_stats;
   bool warmup_done = false;
 
@@ -375,7 +347,11 @@ void FileWorkload(rocksdb::DB* db, TestStats& stats, Cache* cache = nullptr, std
   unordered_map<string, size_t> key_freq_map;
   size_t total_freq = 0;
   size_t n_levels = db->GetOptions().num_levels;
-  std::ifstream file(FLAGS_workload_file);
+  string filename = FLAGS_workload_file;
+  if (file_idx >= 0) {
+    filename += "_" + std::to_string(file_idx);
+  }
+  std::ifstream file(filename);
   std::string line;
   size_t num_operations = 0;
   while (std::getline(file, line)) {
@@ -416,7 +392,7 @@ void FileWorkload(rocksdb::DB* db, TestStats& stats, Cache* cache = nullptr, std
     }
     auto op = operation;
     stats.OP_count++;
-    if (idx % window_size == 0) {
+    if (idx % learning_window_size == 0) {
       auto statistics = db->GetOptions().statistics;
       auto hit_count =
           statistics->getAndResetTickerCount(rocksdb::BLOCK_CACHE_DATA_HIT);
@@ -466,50 +442,42 @@ void FileWorkload(rocksdb::DB* db, TestStats& stats, Cache* cache = nullptr, std
           *out << "blockcache ratio: " << cur_blockcache_ratio << std::endl;
   #endif
           workload_vector = learning_stats.ToVector();
-  #if 1
           // hit rate
           cur_hitrate = stats.get_hitrate(n_levels);
-  #else
-          // baseline latency / real latency
-          float real_time = learning_stats.timer();
-          if (real_time > 1e-6)
-            cur_hitrate = (float)(learning_stats.n_get * baseline.get_time +
-                                  learning_stats.n_put * baseline.put_time +
-                                  (learning_stats.scan_len / 4 +
-                                  learning_stats.n_scan * (n_levels + 1)) *
-                                      baseline.get_time) /
-                          real_time;
-  #endif
           sem.release();
         }
         // reset
         learning_stats.reset();
       }
-      if (out) {
-        if (FLAGS_cache_style == "heap") {
-          auto options = db->GetOptions();
-          auto heapcache = extract_heapcacheshard(options.extern_options->block_cache);
-          auto heapcache_stats = heapcache->stats_;
-          // *out << "hit rate: " << heapcache->get_hit_rate() << std::endl;
-          *out << "hit rate: " << 1 - (float)miss_count / (heapcache_stats.n_block_get + heapcache_stats.n_kv_get)
-                << std::endl;
-          *out << "kv hit rate: "
-                << (float)heapcache_stats.n_kv_hit / heapcache_stats.n_kv_get
-                << std::endl;
-          *out << "block hit rate: "
-                << (float)heapcache_stats.n_block_hit /
-                      heapcache_stats.n_block_get
-                << std::endl;
-          heapcache->reset_stats();
+      
+    }
+    if (idx % print_window_size == 0 && out) {
+      auto statistics = db->GetOptions().statistics;
+      auto miss_count =
+          statistics->getAndResetTickerCount(rocksdb::BLOCK_CACHE_DATA_MISS);
+      if (FLAGS_cache_style == "heap") {
+        auto options = db->GetOptions();
+        auto heapcache = extract_heapcacheshard(options.extern_options->block_cache);
+        auto heapcache_stats = heapcache->stats_;
+        // *out << "hit rate: " << heapcache->get_hit_rate() << std::endl;
+        *out << "hit rate: " << 1 - (float)miss_count / (heapcache_stats.n_block_get + heapcache_stats.n_kv_get)
+              << std::endl;
+        *out << "kv hit rate: "
+              << (float)heapcache_stats.n_kv_hit / heapcache_stats.n_kv_get
+              << std::endl;
+        *out << "block hit rate: "
+              << (float)heapcache_stats.n_block_hit /
+                    heapcache_stats.n_block_get
+              << std::endl;
+        heapcache->reset_stats();
 
-          auto op_time = stats.OP_time / stats.OP_count;
-          *out << "OP time: " << op_time << std::endl;
-        } else {
-          dump_stats(stats, *out, n_levels, FLAGS_cache_style == "block");
-          *out << "counter: " << counter << std::endl;
-        }
-        stats.reset();
+        auto op_time = stats.OP_time / stats.OP_count;
+        *out << "OP time: " << op_time << std::endl;
+      } else {
+        dump_stats(stats, *out, n_levels, FLAGS_cache_style == "block");
+        *out << "counter: " << counter << std::endl;
       }
+      stats.reset();
     }
     auto start = std::chrono::steady_clock::now();
     if (op.type == GET) {
@@ -605,11 +573,50 @@ void FileWorkload(rocksdb::DB* db, TestStats& stats, Cache* cache = nullptr, std
             .count();
     if (idx % max(1, (int)(num_operations / 10)) == 0)
     {
+      auto time_since_launch = chrono::duration_cast<chrono::seconds>(end - launch_time).count();
+      // human readable time
+      std::cout << "Time since launch: " << time_since_launch / 3600 << "h "
+                << (time_since_launch % 3600) / 60 << "m "
+                << time_since_launch % 60 << "s \t";
       std::cout << "Progress: " << (idx * 100) / num_operations << "%\r";
       std::cout.flush();
     }
   }
   delete read_options.extern_options;
+}
+
+void set_table_options(rocksdb::Options& options) {
+  auto table_options =
+      options.table_factory->GetOptions<rocksdb::BlockBasedTableOptions>();
+  table_options->filter_policy.reset(rocksdb::NewBloomFilterPolicy(FLAGS_bpk));
+  options.extern_options = new rocksdb::ExternOptions();
+  options.extern_options->cache_style = FLAGS_cache_style;
+  table_options->block_size = 4096;
+  table_options->max_auto_readahead_size = 0;
+  table_options->checksum = rocksdb::kNoChecksum;
+  if (FLAGS_cache_style == "block") {
+    auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize);
+    table_options->block_cache = block_cache;
+    options.extern_options->block_cache = block_cache;
+  } else if (FLAGS_cache_style == "heap") {
+    auto block_cache =
+        rocksdb::NewHeapCache((size_t)FLAGS_cache_size * FLAGS_kvsize);
+    table_options->block_cache = block_cache;
+    options.extern_options->block_cache = block_cache;
+  }
+  else if (FLAGS_cache_style == "RLCache")
+  {
+    auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize / 2, 0);
+    // auto block_cache = rocksdb::NewHeapCache((size_t)FLAGS_cache_size * FLAGS_kvsize / 2, 0);
+    table_options->block_cache = block_cache;
+    options.extern_options->block_cache = block_cache;
+  }
+  else {
+    table_options->block_cache = rocksdb::NewLRUCache(0);
+    options.extern_options->block_cache = table_options->block_cache;
+  }
+  auto block_cache = options.extern_options->block_cache;
+  cout << "block cache size: " << block_cache->GetCapacity() << endl;
 }
 
 rocksdb::Options get_default_options() {
@@ -622,27 +629,7 @@ rocksdb::Options get_default_options() {
   options.level0_stop_writes_trigger = 8;
   options.max_bytes_for_level_base =
       options.max_bytes_for_level_base * options.max_bytes_for_level_multiplier;
-  auto table_options =
-      options.table_factory->GetOptions<rocksdb::BlockBasedTableOptions>();
-  table_options->filter_policy.reset(rocksdb::NewBloomFilterPolicy(FLAGS_bpk));
-
-  if (FLAGS_cache_style == "block") {
-    auto block_cache = rocksdb::NewLRUCache(FLAGS_cache_size * FLAGS_kvsize);
-    table_options->block_cache = block_cache;
-    options.extern_options = new rocksdb::ExternOptions();
-    options.extern_options->block_cache = block_cache;
-    // options.row_cache = rocksdb::NewLRUCache(FLAGS_cache_size *
-    // FLAGS_kvsize);
-  } else if (FLAGS_cache_style == "range" || FLAGS_cache_style == "lecar"){
-    auto block_cache =
-        rocksdb::NewLRUCache(FLAGS_cache_size * FLAGS_kvsize / 16);
-    table_options->block_cache = block_cache;
-  } else {
-    table_options->no_block_cache = true;
-  }
-
-  table_options->block_size = 4096;
-  table_options->max_auto_readahead_size = 0;
+  set_table_options(options);
   return options;
 }
 
@@ -678,52 +665,27 @@ rocksdb::Options get_moose_options() {
   options.num_levels =
       std::accumulate(run_numbers.begin(), run_numbers.end(), 0);
 
-  auto table_options =
-      options.table_factory->GetOptions<rocksdb::BlockBasedTableOptions>();
-  table_options->filter_policy.reset(rocksdb::NewBloomFilterPolicy(FLAGS_bpk));
-  options.extern_options = new rocksdb::ExternOptions();
-  options.extern_options->cache_style = FLAGS_cache_style;
-  table_options->block_size = 4096;
-  table_options->max_auto_readahead_size = 0;
-  table_options->checksum = rocksdb::kNoChecksum;
-
-  if (FLAGS_cache_style == "block") {
-    auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize);
-    table_options->block_cache = block_cache;
-    options.extern_options->block_cache = block_cache;
-  } else if (FLAGS_cache_style == "heap") {
-    auto block_cache =
-        rocksdb::NewHeapCache((size_t)FLAGS_cache_size * FLAGS_kvsize, 0);
-    table_options->block_cache = block_cache;
-    options.extern_options->block_cache = block_cache;
-  }
-  // else if (FLAGS_cache_style == "range" || FLAGS_cache_style == "lecar")
-  // {
-  //   auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize / 16); 
-  //   table_options->block_cache = block_cache;
-  //   options.extern_options->block_cache = block_cache;
-  // }
-  else if (FLAGS_cache_style == "RLCache")
-  {
-    auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize / 2, 0);
-    // auto block_cache = rocksdb::NewHeapCache((size_t)FLAGS_cache_size * FLAGS_kvsize / 2, 0);
-    table_options->block_cache = block_cache;
-    options.extern_options->block_cache = block_cache;
-  }
-  else {
-    // table_options->no_block_cache = true;
-    table_options->block_cache = rocksdb::NewLRUCache(0);
-    options.extern_options->block_cache = table_options->block_cache;
-  }
-  auto block_cache = options.extern_options->block_cache;
-  cout << "block cache size: " << block_cache->GetCapacity() << endl;
+  set_table_options(options);  
   return options;
+}
+
+void start_test_workers(rocksdb::DB* db, TestStats& stats, Cache* cache = nullptr, std::ofstream* out = nullptr) {
+  std::cout << "Starting test workers with " << FLAGS_worker_threads_num
+            << " threads." << std::endl;
+  std::vector<std::thread> threads;
+  for (int i = 1; i < FLAGS_worker_threads_num; i++) {
+    threads.emplace_back(FileWorkload, db, std::ref(stats), cache, out, i);
+  }
+  FileWorkload(db, stats, cache, out, 0);
+  for (auto& t : threads) {
+    t.join();
+  }
 }
 
 int main(int argc, char** argv) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-  std::ofstream out("/home/jiarui/CacheLSM/results", std::ios::app);
+  std::ofstream out("/home/jiarui/AdCache/results", std::ios::app);
   out << "cache_style: " << FLAGS_cache_style << std::endl;
   out << "bpk: " << FLAGS_bpk << std::endl;
   out << "cache_size: " << FLAGS_cache_size << std::endl;
@@ -736,11 +698,9 @@ int main(int argc, char** argv) {
     options = get_default_options();
   }
 
-  // options.listeners.emplace_back(new FlushCountListener(&out));
-
   if (FLAGS_workload == "test") {
     // options.use_direct_io_for_flush_and_compaction = true;
-    // options.use_direct_reads = true;
+    options.use_direct_reads = true;
   }
   options.statistics = rocksdb::CreateDBStatistics();
   options.advise_random_on_open = false;
@@ -777,6 +737,8 @@ int main(int argc, char** argv) {
       cache = new RLCache(cache_capacity / 2);
     } else if (FLAGS_cache_style == "block" || FLAGS_cache_style == "heap") {
       cache = nullptr;
+    } else if (FLAGS_cache_style == "cacheus") {
+      cache = new RangeCache_Cacheus(cache_capacity);
     } else {
       std::cerr << "Unknown cache style: " << FLAGS_cache_style << std::endl;
       return 1;
@@ -784,20 +746,21 @@ int main(int argc, char** argv) {
     if (cache) std::cout << "cache name: " << cache->name() << std::endl;
   }
 
-
   TestStats test_stats;
   if (FLAGS_workload == "prepare") {
     FileWorkload(db, test_stats, nullptr, &out);
     // PrepareDB_ingestion(db, options);
   } else if (FLAGS_workload == "test") {
     if (FLAGS_cache_style == "RLCache") {
-      std::thread worker(workerFunction);
-      FileWorkload(db, test_stats, cache, &out);
-      exit_worker.store(true);
+      std::thread trainworker(train_worker_function);
+      // FileWorkload(db, test_stats, cache, &out);
+      start_test_workers(db, test_stats, cache, &out);
+      exit_train_worker.store(true);
       sem.release();  // Release in case the worker is waiting.
-      worker.join();
+      trainworker.join();
     } else {
-      FileWorkload(db, test_stats, cache, &out);
+      // FileWorkload(db, test_stats, cache, &out);
+      start_test_workers(db, test_stats, cache, &out);
     }
   }
   std::string stat;
@@ -806,27 +769,6 @@ int main(int argc, char** argv) {
   std::cout << "statistics: " << options.statistics->ToString() << std::endl;
   std::cout << counter << std::endl;
   if (FLAGS_workload == "test") {
-    // auto op_time = test_stats.OP_time / test_stats.OP_count;
-    // out << "OP time: " << op_time << std::endl;
-    // out << "hit rate: " << (double)test_stats.n_hit / test_stats.n_get
-    //     << std::endl;
-    // out << "get time: " << (double)test_stats.get_time / test_stats.n_get
-    //     << std::endl;
-    // out << "put time: " << (double)test_stats.put_time / test_stats.n_put
-    //     << std::endl;
-    // out << "scan time: " << (double)test_stats.scan_time / test_stats.n_scan
-    //     << std::endl;
-    // out << "avg seek in cache: "
-    //     << (float)test_stats.n_in_cache / test_stats.n_scan << std::endl;
-    // out << "avg seek in db: " << (float)test_stats.n_in_db / test_stats.n_scan
-    //     << std::endl;
-    // out << "scan time in cache: "
-    //     << (double)test_stats.time_in_cache / test_stats.length_in_cache * 16
-    //     << std::endl;
-    // out << "scan time in db: "
-    //     << (double)test_stats.time_in_db / test_stats.length_in_db * 16 << std::endl;
-    // out << "avg in db length: "
-    //     << (double)test_stats.length_in_db / test_stats.n_scan << std::endl;
     out << "cache size: " << (cache ? cache->get_capacity() : 0) << std::endl;
     out << "block cache size: " << options.extern_options->block_cache->GetCapacity()
         << std::endl;

@@ -1,5 +1,5 @@
 cd ./MooseLSM/build
-cmake -DCMAKE_PREFIX_PATH=/home/jiarui/CacheLSM/libtorch -DCMAKE_BUILD_TYPE=RELWITHDEBINFO ..
+cmake -DCMAKE_PREFIX_PATH=/home/jiarui/AdCache/libtorch -DCMAKE_BUILD_TYPE=RELWITHDEBINFO ..
 # cmake -DCMAKE_BUILD_TYPE=DEBUG ..
 # cmake -DCMAKE_BUILD_TYPE=RELWITHDEBINFO ..
 # sudo make install
@@ -20,27 +20,13 @@ G=$((1024 * $M))
 
 
 
-log_file=/home/jiarui/CacheLSM/log
-result_file=/home/jiarui/CacheLSM/results
-dir=/home/jiarui/CacheLSM/workload
-db_path=/home/jiarui/CacheLSM/db_20g
-# db_path=/home/jiarui/CacheLSM/db_4g
+log_file=/home/jiarui/AdCache/log
+result_file=/home/jiarui/AdCache/results
+dir=/home/jiarui/AdCache/workload/workload_query
+db_path=/home/jiarui/AdCache/db
 
-prepare_file=/home/jiarui/CacheLSM/workload/workload_datset_20g.dat
-# prepare_file=/home/jiarui/CacheLSM/workload/workload_datset_4g.dat
-
-# workload=scan
-workload=dynamic
-# workload=long_range
-# workload=balanced
-# workload=read
-
-cache_style=block
-# cache_style=range
-# cache_style=LRU
-# cache_style=lecar
-# cache_style=RLCache
-# cache_style=heap
+prepare_file=/home/jiarui/AdCache/workload/dataset_100000000_entries.dat
+num_threads=16
 
 test_cachesize(){
     echo $workload >> $log_file
@@ -56,71 +42,38 @@ test_cachesize(){
     if [ ! -d "$path" ]; then
         ./tools/cache_test -workload="prepare" -bpk=${bpk} -workload_file=${prepare_file} -path=$path >> ${log_file}
     fi
-    # sudo perf record --strict-freq -F 10000 -g -o /home/jiarui/CacheLSM/perf.data \
-    # valgrind --leak-check=full -v --log-file=/home/jiarui/CacheLSM/valgrind-out.txt \
-    ./tools/cache_test -workload="test" -bpk=${bpk} -cache_size=${cache_size} -cache_style=${cache_style} -workload_file=${workload_file} -path=$path >> ${log_file}
-    # sudo perf script -i ../../perf.data > ../../perf.data.script
+    ./tools/cache_test -workload="test" -worker_threads_num=${num_threads} -bpk=${bpk} -cache_size=${cache_size} -cache_style=${cache_style} -workload_file=${workload_file} -path=$path >> ${log_file}
 }
-rm $result_file
 rm $log_file
-
-# test_cachesize 10 100000
-# test_cachesize 10 200000
-# test_cachesize 10 400000
-# test_cachesize 10 800000
-# test_cachesize 10 1600000
-
-# test_cachesize 10 500000
-# test_cachesize 10 1000000
-# test_cachesize 10 2000000
-# test_cachesize 10 4000000
-# test_cachesize 10 8000000
-
-
-# cd ../..
-# python test.py
-
-# ./tools/simple_test
-
-# test_skewness(){
-#     cache_size=$1
-#     # skewness
-#     skewness_workloads=("skewness_5" "skewness_7" "skewness_9" "skewness_95" "skewness_99" "skewness_12")
-#     for skewness_workload in "${skewness_workloads[@]}"; do
-#         echo $skewness_workload
-#         workload=$skewness_workload
-#         rm $result_file
-#         test_cachesize 10 $cache_size
-#         cp /home/jiarui/CacheLSM/results /home/jiarui/CacheLSM/results_${cache_style}_${workload}
-#     done
-# }
-
-# cache_style=RLCache
-# test_skewness 1600000
 
 
 workload=dynamic
 rm $result_file
 cache_style=block
-test_cachesize 10 8000000
-cp /home/jiarui/CacheLSM/results /home/jiarui/CacheLSM/results_${cache_style}_20g
+test_cachesize 10 25000000
+mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
 
 rm $result_file
 cache_style=range
-test_cachesize 10 8000000
-cp /home/jiarui/CacheLSM/results /home/jiarui/CacheLSM/results_${cache_style}_20g
+test_cachesize 10 25000000
+mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
 
 rm $result_file
 cache_style=LRU
-test_cachesize 10 8000000
-cp /home/jiarui/CacheLSM/results /home/jiarui/CacheLSM/results_${cache_style}_20g
+test_cachesize 10 25000000
+mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
 
 rm $result_file
 cache_style=RLCache
-test_cachesize 10 8000000
-cp /home/jiarui/CacheLSM/results /home/jiarui/CacheLSM/results_${cache_style}_20g
+test_cachesize 10 25000000
+mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
 
 rm $result_file
 cache_style=lecar
-test_cachesize 10 8000000
-cp /home/jiarui/CacheLSM/results /home/jiarui/CacheLSM/results_${cache_style}_20g
+test_cachesize 10 25000000
+mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
+
+rm $result_file
+cache_style=cacheus
+test_cachesize 10 25000000
+mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g

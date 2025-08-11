@@ -107,7 +107,7 @@ float cur_hitrate = 0.5;
 std::shared_mutex vector_mutex;
 // std::binary_semaphore sem(0);
 SafeBinarySemaphore sem;
-std::atomic<bool> exit_worker{false};
+std::atomic<bool> exit_train_worker{false};
 
 Actor actor(STATE_DIM, HIDDEN_DIM, ACTION_DIM);
 Critic critic(STATE_DIM, ACTION_DIM, HIDDEN_DIM);
@@ -198,7 +198,7 @@ void update() {
   }
 }
 
-void workerFunction() {
+void train_worker_function() {
   if (LOAD_MODEL) {
     if (!std::filesystem::exists(actor_path) ||
         !std::filesystem::exists(critic_path)) {
@@ -210,10 +210,10 @@ void workerFunction() {
     }
   }
   // load models
-  while (!exit_worker.load()) {
+  while (!exit_train_worker.load()) {
     // Wait until a signal is received.
     sem.acquire();
-    if (exit_worker.load()) break;
+    if (exit_train_worker.load()) break;
     update();
     // LOGGING
     if (LOGGING) {
