@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import os
 import random
 import zipf
 import argparse
@@ -49,7 +50,7 @@ def generate_workload(dist, workload: Workload, db: list[str], output_files: lis
         unique_keys.add(i)
     print(f"Unique keys in read: {len(unique_keys)}")
     
-    # short scan
+    # scan
     num_scan = int(workload.num_queries * (workload.short_scan_ratio + workload.long_scan_ratio))
     t = dist.sample(num_scan)
     unique_keys = set()
@@ -85,22 +86,28 @@ def generate_workload(dist, workload: Workload, db: list[str], output_files: lis
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
-    parser.add_argument('--prepare-num', type=int, required=True, help='number of keys to prepare in the database')
+    parser.add_argument('--key-range', type=int, required=True, help='query key range')
     parser.add_argument('--output', type=str, required=True)
     parser.add_argument('--file-num', type=int, default=1, help='queries are split into this many files')
     args = parser.parse_args()
     
     CONFIG_FILE = args.config
-    DB_SIZE = args.prepare_num
+    DB_SIZE = 100_000_000
     OUTPUT_FILE = args.output
+    QUERY_RANGE = args.key_range
+    
+    db_file = f"dataset.dat"
+    if not os.path.exists(db_file):
+        db = get_db(DB_SIZE)
+        with open(db_file, 'w') as f:
+            for key in db:
+                f.write("INSERT " + key + '\n')
     
     files = [f"{OUTPUT_FILE}_{i}" for i in range(args.file_num)]
 
     workloads = get_config(CONFIG_FILE)
-    db = get_db(DB_SIZE)
-    with open(f"dataset_{DB_SIZE}_entries.dat", 'w') as f:
-        for key in db:
-            f.write("INSERT " + key + '\n')
+    db = get_db(QUERY_RANGE)
+    
     # if OUTPUT_FILE exists, clear it
     for output_file in files:
         with open(output_file, 'w') as f:

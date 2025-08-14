@@ -8,34 +8,139 @@
 #include <iostream>
 #include <semaphore>
 
+#include "rocksdb/advanced_cache.h"
+#include "rocksdb/db.h"
+#include "rocksdb/options.h"
+#include "rocksdb/statistics.h"
+#include "tools/sharded_cache/Utils.h"
+#include "tools/sharded_cache/ShardedCacheBase.h"
+
 #define LOGGING 1
 #define LOAD_MODEL 1
 #define SAVE_MODEL 0
 #define ONLINE_LEARNING 0
 
+// updated by main thread
+std::vector<float> workload_vector(WORKLOAD_DIM, 0.0);
+std::vector<float> workload_vector_prev(WORKLOAD_DIM, 0.0);
+
+float cur_hitrate = 0.5;
+
 class SafeBinarySemaphore {
- public:
-  SafeBinarySemaphore() : sem(0), signaled(false) {}
+public:
+  SafeBinarySemaphore() : sem_(0), signaled_(false) {}
 
-  // Only call release if not already signaled.
-  void release() {
+  // Non-blocking trigger: coalesces multiple releases into one.
+  // Returns true iff this call actually signaled the worker.
+  bool trigger() {
     bool expected = false;
-    // Attempt to set 'signaled' to true; if it was already true, do nothing.
-    if (signaled.compare_exchange_strong(expected, true)) {
-      sem.release();
+    if (signaled_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      // It's critical we only call release() when transitioning false->true,
+      // because std::binary_semaphore is a counting_semaphore<1>; overflowing is UB.
+      sem_.release();
+      return true;
     }
+    return false; // already signaled or worker still running
   }
 
-  // Acquire the semaphore and reset the signaled flag.
-  void acquire() {
-    sem.acquire();
-    signaled.store(false);
+  // Worker side: wait until triggered.
+  void wait() {
+    sem_.acquire();
+    // Keep signaled_ == true while work is in progress to coalesce further triggers.
+    // (So calls to trigger() during work won't release again.)
   }
 
- private:
-  std::binary_semaphore sem;
-  std::atomic<bool> signaled;
+  // Worker marks completion; allows a *new* trigger to arm another run.
+  void done() {
+    signaled_.store(false, std::memory_order_release);
+  }
+
+  // Optional: non-blocking check (worker poll style).
+  bool try_wait() {
+    if (sem_.try_acquire()) return true;
+    return false;
+  }
+
+  // Optional: report whether a run is queued or in-progress.
+  bool is_signaled() const {
+    return signaled_.load(std::memory_order_acquire);
+  }
+
+private:
+  std::binary_semaphore sem_;
+  std::atomic<bool>     signaled_;
 };
+
+void sync_model_cache(rocksdb::DB* db = nullptr,
+                      size_t max_cache_size = 1e8,
+                      size_t kvsize = 1024,
+                      std::optional<ShardedCacheBase> cache = std::nullopt,
+                      std::ostream* out = &std::cout) {
+  if (!db || !cache || cache->name != "adcache") return;
+
+  auto statistics = db->GetOptions().statistics;
+  auto hit_count =
+      statistics->getAndResetTickerCount(rocksdb::BLOCK_CACHE_DATA_HIT);
+  auto miss_count =
+      statistics->getAndResetTickerCount(rocksdb::BLOCK_CACHE_DATA_MISS);
+  stats.n_block_get = hit_count + miss_count;
+  stats.n_block_hit = hit_count;
+  stats.n_block_miss = miss_count;
+
+  bool warmup_done = cache->warmup_done();
+  learning_stats.warmup_done = cache->warmup_done();
+  
+  if (warmup_done) {
+// sync cache capacity
+#if 1
+    float cache_ratio = 0;
+    {
+      std::shared_lock<std::shared_mutex> lock(vector_mutex);
+      cache_ratio = cache_params_vector[params_put_idx()];
+    }
+     
+    // gradually change the cache size to avoid too much eviction
+    cache_ratio = cache_ratio * 0.2 + 0.8 * cache->get_capacity() / max_cache_size;
+    std::clamp(cache_ratio, 0.01f, 0.99f);
+    // if (learning_stats.n_scan == 0) {
+    //   cache_ratio = (float)cache->get_capacity() / FLAGS_cache_size;
+    //   cache_ratio = max((float)0.1, cache_ratio);
+    //   if (rl_cache->get_size() >= rl_cache->get_capacity() * 0.9)
+    //     cache_ratio = min(1.0, cache_ratio + 0.1);
+    // } else {
+    //   cache_ratio *= 0.94;
+    // }
+
+    // maybe stablize
+#if 1
+    if (cache_ratio < 0.02)
+      cache_ratio = 0;
+    else if (cache_ratio > 0.98)
+      cache_ratio = 1;
+#endif
+    // update cache
+    float cur_blockcache_ratio = 1 - cache_ratio;
+    {
+      cache->set_capacity((size_t)(cache_ratio * max_cache_size)); 
+      auto blockcache = db->GetOptions().extern_options->block_cache;
+      size_t size = cur_blockcache_ratio * max_cache_size * kvsize;
+      blockcache->SetCapacity(size);
+    }
+    // update model
+    {
+      std::unique_lock<std::shared_mutex> lock(vector_mutex);
+      cache_params_vector[params_put_idx()] = cache_ratio;
+      workload_vector = learning_stats.ToVector();
+      cur_hitrate = std::accumulate(hit_rates.begin(), hit_rates.end(), 0.0) / hit_rates.size();
+      hit_rates.clear();
+    }
+    std::cout << "blockcache ratio: " << cur_blockcache_ratio << std::endl;
+    *out << "blockcache ratio: " << cur_blockcache_ratio << std::endl;
+#endif
+  }
+  // reset
+  learning_stats.reset();
+}
 
 struct ActorImpl : torch::nn::Module {
   torch::nn::Linear fc1{nullptr}, fc2{nullptr}, fc3{nullptr};
@@ -78,33 +183,6 @@ struct CriticImpl : torch::nn::Module {
 };
 TORCH_MODULE(Critic);
 
-const int RANGE_COUNT = 1;
-const int WORKLOAD_DIM = RANGE_COUNT + 4;  // Workload input dimension.
-const int CACHE_PARAM_DIM =
-    RANGE_COUNT * 2 + 2;  // Current cache parameters dimension.
-// const int STATE_DIM = WORKLOAD_DIM + CACHE_PARAM_DIM;
-const int STATE_DIM = WORKLOAD_DIM;
-const int ACTION_DIM =
-    CACHE_PARAM_DIM;  // We'll adjust the cache parameters continuously.
-const int HIDDEN_DIM = 640;
-const double ACTOR_LR = 1e-4;
-const double CRITIC_LR = 1e-3;
-const double GAMMA = 0.99;
-const int NUM_STEPS = 1;
-int n_updates = 0;
-
-// updated by sub thread
-// 0～-3: range lookup param
-// -2: point lookup param
-// -1: block cache size
-std::vector<float> cache_params_vector(CACHE_PARAM_DIM, 1.0);
-
-// updated by main thread
-std::vector<float> workload_vector(WORKLOAD_DIM, 0.0);
-std::vector<float> workload_vector_prev(WORKLOAD_DIM, 0.0);
-
-float cur_hitrate = 0.5;
-std::shared_mutex vector_mutex;
 // std::binary_semaphore sem(0);
 SafeBinarySemaphore sem;
 std::atomic<bool> exit_train_worker{false};
@@ -192,13 +270,13 @@ void update() {
       current_cache_params.data_ptr<float>(),
       current_cache_params.data_ptr<float>() + current_cache_params.numel());
   {
-    std::shared_lock<std::shared_mutex> lock(vector_mutex);
+    std::unique_lock<std::shared_mutex> lock(vector_mutex);
     cache_params_vector = vec;
     assert(cache_params_vector.size() == CACHE_PARAM_DIM);
   }
 }
 
-void train_worker_function() {
+void train_worker_function(rocksdb::DB* db, size_t max_cache_size, size_t kv_size, std::optional<ShardedCacheBase>& cache, std::ostream* out = &std::cout) {
   if (LOAD_MODEL) {
     if (!std::filesystem::exists(actor_path) ||
         !std::filesystem::exists(critic_path)) {
@@ -212,9 +290,12 @@ void train_worker_function() {
   // load models
   while (!exit_train_worker.load()) {
     // Wait until a signal is received.
-    sem.acquire();
+    // sem.acquire();
+    sem.wait();
     if (exit_train_worker.load()) break;
+    sync_model_cache(db, max_cache_size, kv_size, cache, out);
     update();
+    sem.done();
     // LOGGING
     if (LOGGING) {
       std::cout << "--------------------------------" << std::endl;

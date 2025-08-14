@@ -13,6 +13,7 @@ if [ $rc -ne 0 ]; then
     echo "make failed"
     exit $rc
 fi
+echo "make done"
 K=1024
 M=$((1024 * $K))
 G=$((1024 * $M))
@@ -25,7 +26,7 @@ result_file=/home/jiarui/AdCache/results
 dir=/home/jiarui/AdCache/workload/workload_query
 db_path=/home/jiarui/AdCache/db
 
-prepare_file=/home/jiarui/AdCache/workload/dataset_100000000_entries.dat
+prepare_file=/home/jiarui/AdCache/workload/dataset.dat
 num_threads=16
 
 test_cachesize(){
@@ -33,7 +34,7 @@ test_cachesize(){
     echo $workload >> $result_file
     workload_file=${dir}/${workload}_query.dat
     n_lines=$(wc -l < ${prepare_file})
-    n_queries=$(wc -l < ${workload_file})
+    n_queries=$(wc -l < ${workload_file}_0)
     bpk=$1
     cache_size=$2
     path=$db_path
@@ -46,34 +47,40 @@ test_cachesize(){
 }
 rm $log_file
 
-
-workload=dynamic
+workload=test
 rm $result_file
 cache_style=block
-test_cachesize 10 25000000
-mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
+test_cachesize 10 400000
+mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_400m
+mv /home/jiarui/AdCache/log /home/jiarui/AdCache/log_${cache_style}_400m
 
-rm $result_file
-cache_style=range
-test_cachesize 10 25000000
-mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
+# workload=dynamic
+# rm $result_file
+# cache_style=block
+# test_cachesize 10 25000000
+# mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
 
-rm $result_file
-cache_style=LRU
-test_cachesize 10 25000000
-mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
+# rm $result_file
+# cache_style=range
+# test_cachesize 10 25000000
+# mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
 
-rm $result_file
-cache_style=RLCache
-test_cachesize 10 25000000
-mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
+# rm $result_file
+# cache_style=kv
+# test_cachesize 10 25000000
+# mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
 
-rm $result_file
-cache_style=lecar
-test_cachesize 10 25000000
-mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
+# rm $result_file
+# cache_style=adcache
+# test_cachesize 10 25000000
+# mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
 
-rm $result_file
-cache_style=cacheus
-test_cachesize 10 25000000
-mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
+# rm $result_file
+# cache_style=lecar
+# test_cachesize 10 25000000
+# mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g
+
+# rm $result_file
+# cache_style=cacheus
+# test_cachesize 10 25000000
+# mv /home/jiarui/AdCache/results /home/jiarui/AdCache/results_${cache_style}_100g

@@ -14,7 +14,7 @@
 #include "rocksdb/monkey_filter.h"
 #include "rocksdb/options.h"
 #include "rocksdb/statistics.h"
-#include "tools/data_structure.h"
+#include "tools/sharded_cache/ShardedCacheBuilder.h"
 #include "tools/operation_with_cache.h"
 #include "tools/torch_train.h"
 #include "util/string_util.h"
@@ -34,24 +34,17 @@ DEFINE_string(path, "/tmp/db", "dbpath");
 DEFINE_string(workload_file, "workload", "workload file");
 DEFINE_int32(cache_size, 0, "Cache size");
 DEFINE_int32(sst_size, 4194304, "SST size");
-DEFINE_string(cache_style, "block", "Cache style: LRU, ELRU, heap, range, RLCache, block, lecar, cacheus");
-DEFINE_int32(worker_threads_num, 0, "Number of worker threads");
+DEFINE_string(cache_style, "block", "Cache style: kv, range, adcache, block, lecar, cacheus");
+DEFINE_int32(worker_threads_num, 1, "Number of worker threads");
 
 // for learning
 std::random_device rd;
 std::mt19937 gen(rd());
 size_t max_possible_scan_len = 64;
-std::set<std::string> query_keys;
-std::map<std::string, size_t> str_to_param_idx;
-uint64_t db_size = 0;
+K min_key = 0;
+K max_key = 1e8;
+size_t num_keys = 0;
 auto launch_time = chrono::steady_clock::now();
-
-inline std::string ItoaWithPadding(const uint64_t key, uint64_t size) {
-  std::string key_str = std::to_string(key);
-  std::string padding_str(size - key_str.size(), '0');
-  key_str = padding_str + key_str;
-  return key_str;
-}
 
 enum OperationType { GET, PUT, DELETE, SCAN };
 
@@ -118,7 +111,6 @@ std::vector<Operation> get_operations_from_file(const std::string& file_path) {
       if (operation.length > max_possible_scan_len)
         max_possible_scan_len = operation.length;
     }
-    query_keys.insert(operation.key);
     operations.push_back(operation);
   }
   max_possible_scan_len *= 1.1;
@@ -126,26 +118,11 @@ std::vector<Operation> get_operations_from_file(const std::string& file_path) {
 }
 
 void construct_cache_param_table() {
-  std::vector<string> keys(query_keys.begin(), query_keys.end());
-  size_t range_size = keys.size() / RANGE_COUNT;
+  size_t range_size = (max_key - min_key) / RANGE_COUNT;
   for (size_t i = 1; i < RANGE_COUNT; i++) {
-    str_to_param_idx[keys[i * range_size]] = i - 1;
+    str_to_param_idx[i * range_size + min_key] = i - 1;
   }
 }
-
-size_t params_scan_idx(string key) {
-  return 0;
-  auto it = str_to_param_idx.upper_bound(key);
-  size_t idx = RANGE_COUNT - 1;
-  if (it != str_to_param_idx.end()) {
-    idx = it->second;
-  }
-  return idx * 2;
-}
-
-size_t params_get_idx() { return cache_params_vector.size() - 2; }
-
-size_t params_put_idx() { return cache_params_vector.size() - 1; }
 
 void remove_dup_and_sort(std::vector<Operation>& ops) {
   std::sort(ops.begin(), ops.end(), [](const Operation& a, const Operation& b) {
@@ -198,110 +175,34 @@ void PrepareDB_ingestion(rocksdb::DB* db, rocksdb::Options options) {
     }
   }
 }
-// statistics for learning
-struct LearningStatistics {
-  size_t operation_count = 0;
-  size_t n_get = 0;
-  size_t n_scan = 0;
-  size_t n_put = 0;
-  size_t scan_len = 0;
-  float last_timer = chrono::duration_cast<chrono::microseconds>(
-                         chrono::steady_clock::now().time_since_epoch())
-                         .count();
 
-  float avg_scan_len = 0;
-  size_t max_scan_len = 0;
-  int freq[RANGE_COUNT] = {0};
-
-  float timer() {
-    auto now = chrono::duration_cast<chrono::microseconds>(
-                   chrono::steady_clock::now().time_since_epoch())
-                   .count();
-    float res = now - last_timer;
-    last_timer = now;
-    return res;
+void dump_stats(std::ofstream& out, size_t n_levels, bool block_cache = false) {
+  if (stats.OP_count == 0) {
+    stats.OP_count = 100000;
   }
-
-  void get() {
-    operation_count++;
-    n_get++;
-  }
-  void put() {
-    operation_count++;
-    n_put++;
-  }
-  void scan(string key, size_t len) {
-    operation_count++;
-    scan_len += len;
-    avg_scan_len = (avg_scan_len * n_scan + len) / (n_scan + 1);
-    n_scan++;
-    max_scan_len = std::max(max_scan_len, len);
-    size_t idx = params_scan_idx(key) / 2;
-    freq[idx]++;
-  }
-
-  vector<float> ToVector() {
-    vector<float> res;
-    res.push_back((float)n_get / operation_count);
-    res.push_back((float)n_scan / operation_count);
-    res.push_back((float)n_put / operation_count);
-    res.push_back((float)avg_scan_len / max_possible_scan_len);
-    res.push_back((float)FLAGS_cache_size * 1024/ db_size);
-    // for (size_t i = 0; i < RANGE_COUNT; i++) {
-    //   if (n_scan == 0)
-    //     res.push_back(0);
-    //   else
-    //     res.push_back((float)freq[i] / n_scan);
-    // }
-    return res;
-  }
-
-  void reset() {
-    operation_count = 0;
-    n_get = 0;
-    n_scan = 0;
-    n_put = 0;
-    avg_scan_len = 0;
-    max_scan_len = 0;
-    std::fill(freq, freq + RANGE_COUNT, 0);
-  }
-};
-
-void dump_stats(TestStats& test_stats, std::ofstream& out, size_t n_levels, bool block_cache = false) {
-  // std::ofstream out("/home/jiarui/CacheLSM/results", std::ios::app);
-  if (test_stats.OP_count == 0) {
-    test_stats.OP_count = 100000;
-  }
-  auto op_time = test_stats.OP_time / test_stats.OP_count;
+  auto op_time = stats.OP_time / stats.OP_count;
   out << "OP time: " << op_time << std::endl;
-  out << "hit rate: " << test_stats.get_hitrate(n_levels) << std::endl;
-  out << "kv hit rate: " << (double)test_stats.n_hit / test_stats.n_get
+  out << "hit rate: " << stats.get_hitrate(n_levels) << std::endl;
+  out << "kv hit rate: " << (double)stats.n_hit / stats.n_get
       << std::endl;
   out << "scan hit rate: "
-      << (double)test_stats.length_in_cache /
-             (test_stats.length_in_cache + test_stats.length_in_db)
+      << (double)stats.length_in_cache /
+             (stats.length_in_cache + stats.length_in_db)
       << std::endl;
   out << "block hits: "
-      << (double)test_stats.n_block_hit / (test_stats.n_scan * (n_levels + 1))
+      << (double)stats.n_block_hit / (stats.n_scan * (n_levels + 1))
       << std::endl;
-  out << "get time: " << (double)test_stats.get_time / test_stats.n_get
+  out << "get time: " << (double)stats.get_time / stats.n_get
       << std::endl;
-  out << "put time: " << (double)test_stats.put_time / test_stats.n_put
+  out << "put time: " << (double)stats.put_time / stats.n_put
       << std::endl;
-  out << "scan time: " << (double)test_stats.scan_time / test_stats.n_scan
+  out << "scan time: " << (double)stats.scan_time / stats.n_scan
       << std::endl;
-  out << "db scan time: " << (double)test_stats.time_in_db / (test_stats.length_in_db + 1)
+  out << "db scan time: " << (double)stats.time_in_db / (stats.length_in_db + 1)
       << std::endl;
   out << "cache scan time: "
-      << (double)test_stats.time_in_cache / (test_stats.length_in_cache + 1)
+      << (double)stats.time_in_cache / (stats.length_in_cache + 1)
       << std::endl;
-  // out.close();
-}
-
-void set_blockcache_capacity(rocksdb::Options options, float ratio) {
-  auto blockcache = options.extern_options->block_cache;
-  size_t size = ratio * FLAGS_cache_size * FLAGS_kvsize;
-  blockcache->SetCapacity(size);
 }
 
 rocksdb::heap_cache::HeapCacheShard* extract_heapcacheshard(shared_ptr<rocksdb::Cache> block_cache, int i = 0)
@@ -318,24 +219,17 @@ rocksdb::heap_cache::HeapCacheShard* extract_heapcacheshard(shared_ptr<rocksdb::
   return nullptr;
 }
 
-void set_cache_capacity(RangeCache* cache, float ratio) {
-  cache->set_capacity((size_t)(ratio * FLAGS_cache_size)); 
-}
-
-
-void FileWorkload(rocksdb::DB* db, TestStats& stats, Cache* cache = nullptr, std::ofstream* out = nullptr, int file_idx = -1) {
+void FileWorkload(rocksdb::DB* db, std::optional<ShardedCacheBase>& cache, std::ofstream* out = nullptr, int file_idx = -1) {
   rocksdb::ReadOptions read_options;
   read_options.extern_options = new rocksdb::ExternOptions();
   read_options.extern_options->cache_style = FLAGS_cache_style;
   read_options.verify_checksums = false;
 
-  size_t learning_window_size = (size_t)1e3;
   size_t print_window_size = (size_t)1e3;
-  LearningStatistics learning_stats;
   bool warmup_done = false;
 
-  if (FLAGS_cache_style == "RLCache") {
-    // construct_cache_param_table();
+  if (FLAGS_cache_style == "adcache") {
+    construct_cache_param_table();
     cache_params_vector[params_get_idx()] = 0.01;
     cache_params_vector[params_put_idx()] = 0.5;
   }
@@ -365,141 +259,53 @@ void FileWorkload(rocksdb::DB* db, TestStats& stats, Cache* cache = nullptr, std
   size_t idx = 0;
   while (std::getline(file, line)) {
     idx++;
-    Operation operation;
+    Operation op;
+    // read operation from line
     {
       std::istringstream iss(line);
-      std::string op;
-      iss >> op;
-      if (op == "GET" || op == "READ") {
-        operation.type = GET;
-      } else if (op == "PUT" || op == "INSERT" || op == "UPDATE") {
-        operation.type = PUT;
-        operation.value = random_value(FLAGS_kvsize - 24);
-      } else if (op == "DELETE") {
-        operation.type = DELETE;
-      } else if (op == "SCAN") {
-        operation.type = SCAN;
+      std::string op_str;
+      iss >> op_str;
+      if (op_str == "GET" || op_str == "READ") {
+        op.type = GET;
+      } else if (op_str == "PUT" || op_str == "INSERT" || op_str == "UPDATE") {
+        op.type = PUT;
+        op.value = random_value(FLAGS_kvsize - 24);
+      } else if (op_str == "DELETE") {
+        op.type = DELETE;
+      } else if (op_str == "SCAN") {
+        op.type = SCAN;
       } else {
-        std::cerr << "Unknown operation: " << op << std::endl;
+        std::cerr << "Unknown operation: " << op_str << std::endl;
         exit(1);
       }
-      iss >> operation.key;
-      if (operation.type == SCAN) {
-        iss >> operation.length;
-        if (operation.length > max_possible_scan_len)
-          max_possible_scan_len = operation.length;
+      iss >> op.key;
+      if (op.type == SCAN) {
+        iss >> op.length;
+        if (op.length > max_possible_scan_len)
+          max_possible_scan_len = op.length;
       }
     }
-    auto op = operation;
-    stats.OP_count++;
-    if (idx % learning_window_size == 0) {
-      auto statistics = db->GetOptions().statistics;
-      auto hit_count =
-          statistics->getAndResetTickerCount(rocksdb::BLOCK_CACHE_DATA_HIT);
-      auto miss_count =
-          statistics->getAndResetTickerCount(rocksdb::BLOCK_CACHE_DATA_MISS);
-      stats.n_block_get = hit_count + miss_count;
-      stats.n_block_hit = hit_count;
-      stats.n_block_miss = miss_count;
-      // train and reset
-      if (FLAGS_cache_style == "RLCache"){
-        if (!warmup_done && cache) {
-          // auto rl_cache = dynamic_cast<RLCache*>(cache);
-          auto rl_cache = dynamic_cast<RangeCache*>(cache);
-          if (!warmup_done && rl_cache->get_size() >= rl_cache->get_capacity() * 0.9) {
-            warmup_done = true;
-            learning_stats.timer();
-          }
-        }
-        // train
-        else if (warmup_done) {
-          std::shared_lock<std::shared_mutex> lock(vector_mutex);
-  #if 1
-          float cache_ratio = cache_params_vector[params_put_idx()];
-          auto rl_cache = dynamic_cast<RangeCache*>(cache);
-          // gradually change the cache size to avoid too much eviction
-          // cache_ratio = cache_ratio * 0.2 + 0.8 * rl_cache->get_capacity() / FLAGS_cache_size; 
-          if (learning_stats.n_scan == 0) 
-          {
-            cache_ratio = (float) rl_cache->get_capacity() / FLAGS_cache_size;
-            cache_ratio = max((float)0.1, cache_ratio);
-            if (rl_cache->get_size() >= rl_cache->get_capacity() * 0.9)
-              cache_ratio = min(1.0, cache_ratio + 0.1);
-          }
-          else
-          {
-            cache_ratio *= 0.94;
-          }
-          // if (cache_ratio < 0.02)
-          //   cache_ratio = 0;
-          // else if (cache_ratio > 0.08)
-          //   cache_ratio = 1;
-          float cur_blockcache_ratio = 1 - cache_ratio;
-          set_cache_capacity(rl_cache, cache_ratio);
-          set_blockcache_capacity(db->GetOptions(), cur_blockcache_ratio);
-          cache_params_vector[params_put_idx()] = cache_ratio;
-          cout << "blockcache ratio: " << cur_blockcache_ratio << endl;
-          *out << "blockcache ratio: " << cur_blockcache_ratio << std::endl;
-  #endif
-          workload_vector = learning_stats.ToVector();
-          // hit rate
-          cur_hitrate = stats.get_hitrate(n_levels);
-          sem.release();
-        }
-        // reset
-        learning_stats.reset();
-      }
-      
-    }
-    if (idx % print_window_size == 0 && out) {
-      auto statistics = db->GetOptions().statistics;
-      auto miss_count =
-          statistics->getAndResetTickerCount(rocksdb::BLOCK_CACHE_DATA_MISS);
-      if (FLAGS_cache_style == "heap") {
-        auto options = db->GetOptions();
-        auto heapcache = extract_heapcacheshard(options.extern_options->block_cache);
-        auto heapcache_stats = heapcache->stats_;
-        // *out << "hit rate: " << heapcache->get_hit_rate() << std::endl;
-        *out << "hit rate: " << 1 - (float)miss_count / (heapcache_stats.n_block_get + heapcache_stats.n_kv_get)
-              << std::endl;
-        *out << "kv hit rate: "
-              << (float)heapcache_stats.n_kv_hit / heapcache_stats.n_kv_get
-              << std::endl;
-        *out << "block hit rate: "
-              << (float)heapcache_stats.n_block_hit /
-                    heapcache_stats.n_block_get
-              << std::endl;
-        heapcache->reset_stats();
 
-        auto op_time = stats.OP_time / stats.OP_count;
-        *out << "OP time: " << op_time << std::endl;
-      } else {
-        dump_stats(stats, *out, n_levels, FLAGS_cache_style == "block");
-        *out << "counter: " << counter << std::endl;
+    if (learning_stats.operation_count > learning_stats.learning_window_size)
+      // inform learning worker
+      sem.trigger();
+    
+
+    if (idx % print_window_size == 0 && out && file_idx <= 0) {
+      dump_stats(*out, n_levels, FLAGS_cache_style == "block");
+      {
+        std::unique_lock<std::shared_mutex> lock(vector_mutex);
+        hit_rates.push_back(stats.get_hitrate(n_levels));
       }
       stats.reset();
     }
-    auto start = std::chrono::steady_clock::now();
     if (op.type == GET) {
-      stats.n_get++;
-      std::string value;
-      auto s = chrono::steady_clock::now();
-      rocksdb::Status status = rocksdb::Status::OK();
-      if (FLAGS_cache_style != "RLCache") {
-        status = get_with_cache(db, cache, op.key, value, stats);
-      } else {
-        auto rl_cache = dynamic_cast<RLCache*>(cache);
-        if (rl_cache->get(op.key, value)) {
-          stats.n_hit++;
-        } else {
-          status = db->Get(read_options, op.key, &value);
-          float threshold = cache_params_vector[params_get_idx()];  
-          rl_cache->put(op.key, value, threshold);
-        }
+      float threshold = 0.0;
+      if (FLAGS_cache_style == "adcache") {
+        std::shared_lock<std::shared_mutex> lock(vector_mutex);
+        threshold = cache_params_vector[params_get_idx()];
       }
-      auto e = chrono::steady_clock::now();
-      stats.get_time +=
-          chrono::duration_cast<chrono::microseconds>(e - s).count();
+      auto status = get_with_cache(db, cache, op.key, threshold);
       learning_stats.get();
 
       if (!status.ok()) {
@@ -508,72 +314,43 @@ void FileWorkload(rocksdb::DB* db, TestStats& stats, Cache* cache = nullptr, std
         exit(1);
       }
     } else if (op.type == PUT) {
-      stats.n_put++;
-      auto s = chrono::steady_clock::now();
-      auto status = put_with_cache(db, cache, op.key, op.value, stats);
-      auto e = chrono::steady_clock::now();
-      stats.put_time +=
-          chrono::duration_cast<chrono::microseconds>(e - s).count();
+      auto status = put_with_cache(db, cache, op.key, op.value);
       learning_stats.put();
+
       if (!status.ok()) {
         std::cerr << "Failed to put key " << op.key
                   << " status:" << status.ToString() << std::endl;
         exit(1);
       }
     } else if (op.type == DELETE) {
-      auto status = delete_with_cache(db, cache, op.key, stats);
-      if (!status.ok()) {
-        std::cerr << "Failed to delete key " << op.key 
-                  << " status:" << status.ToString() << std::endl;
-        exit(1);
-      }
+      throw std::runtime_error("Delete operation is not implemented yet.");
     } else if (op.type == SCAN) {
-      stats.n_scan++;
-      stats.scan_length += op.length;
-      learning_stats.scan(op.key, op.length);
-      auto s = chrono::steady_clock::now();
-      if (FLAGS_cache_style != "RLCache") {
-        scan_with_cache(db, cache, op.key, op.length, stats);
-      } else {
-        size_t cache_length = max_possible_scan_len;
-        if (warmup_done) {
-          auto i = params_scan_idx(op.key);
-          float a = cache_params_vector[i];
-          float b = cache_params_vector[i + 1];
-          
-          if (a < 0 || a > 1 || b < 0 || b > 1) {
-            std::cerr << "Invalid cache params: ";
-            for (auto& it : cache_params_vector) {
-              std::cerr << it << " ";
-            }
-            std::cerr << std::endl;
-            exit(1);
-          }
-          a *= max_possible_scan_len;
-          a = max((float)16, a);
-          if (op.length > a) {
-            cache_length -= a;
-            cache_length *= b; 
-            cache_length += a;
-          }
+      size_t cache_length = op.length;
+      if (FLAGS_cache_style == "adcache") {
+        std::shared_lock<std::shared_mutex> lock(vector_mutex);
+        auto i = params_scan_idx(op.key);
+        auto a = cache_params_vector[i];
+        auto b = cache_params_vector[i + 1];
+        std::clamp(a, 0.0f, 1.0f);
+        std::clamp(b, 0.0f, 1.0f);
+        a *= max_possible_scan_len;
+        a = std::max((float)16, a);
+        if (op.length > a) {
+          cache_length -= a;
+          cache_length *= b; 
+          cache_length += a;
+        } else {
+          cache_length = max_possible_scan_len;
         }
-        auto range_cache = dynamic_cast<RangeCache*>(cache);
-        // if (range_cache->get_capacity() < 0.1 * FLAGS_cache_size) {
-        //   cache_length = 0;
-        // }
-        range_cache_scan_with_len(db, read_options, range_cache, op.key, op.length, cache_length, stats);
       }
-      auto e = chrono::steady_clock::now();
-      stats.scan_time +=
-          chrono::duration_cast<chrono::microseconds>(e - s).count();
+
+      scan_with_cache(db, cache, op.key, op.length, cache_length);
+      learning_stats.scan(op.key, op.length);
     }
-    auto end = std::chrono::steady_clock::now();
-    stats.OP_time +=
-        std::chrono::duration_cast<std::chrono::microseconds>(end - start)
-            .count();
+
     if (idx % max(1, (int)(num_operations / 10)) == 0)
     {
-      auto time_since_launch = chrono::duration_cast<chrono::seconds>(end - launch_time).count();
+      auto time_since_launch = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - launch_time).count();
       // human readable time
       std::cout << "Time since launch: " << time_since_launch / 3600 << "h "
                 << (time_since_launch % 3600) / 60 << "m "
@@ -595,19 +372,13 @@ void set_table_options(rocksdb::Options& options) {
   table_options->max_auto_readahead_size = 0;
   table_options->checksum = rocksdb::kNoChecksum;
   if (FLAGS_cache_style == "block") {
-    auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize);
-    table_options->block_cache = block_cache;
-    options.extern_options->block_cache = block_cache;
-  } else if (FLAGS_cache_style == "heap") {
-    auto block_cache =
-        rocksdb::NewHeapCache((size_t)FLAGS_cache_size * FLAGS_kvsize);
+    auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize, NUM_SHARDS);
     table_options->block_cache = block_cache;
     options.extern_options->block_cache = block_cache;
   }
-  else if (FLAGS_cache_style == "RLCache")
+  else if (FLAGS_cache_style == "adcache")
   {
-    auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize / 2, 0);
-    // auto block_cache = rocksdb::NewHeapCache((size_t)FLAGS_cache_size * FLAGS_kvsize / 2, 0);
+    auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize / 2, NUM_SHARDS);
     table_options->block_cache = block_cache;
     options.extern_options->block_cache = block_cache;
   }
@@ -669,14 +440,14 @@ rocksdb::Options get_moose_options() {
   return options;
 }
 
-void start_test_workers(rocksdb::DB* db, TestStats& stats, Cache* cache = nullptr, std::ofstream* out = nullptr) {
+void start_test_workers(rocksdb::DB* db, std::optional<ShardedCacheBase>& cache, std::ofstream* out = nullptr) {
   std::cout << "Starting test workers with " << FLAGS_worker_threads_num
             << " threads." << std::endl;
   std::vector<std::thread> threads;
-  for (int i = 1; i < FLAGS_worker_threads_num; i++) {
-    threads.emplace_back(FileWorkload, db, std::ref(stats), cache, out, i);
+  for (int i = 0; i < FLAGS_worker_threads_num; i++) {
+    threads.emplace_back(FileWorkload, db, std::ref(cache), out, i);
   }
-  FileWorkload(db, stats, cache, out, 0);
+
   for (auto& t : threads) {
     t.join();
   }
@@ -700,7 +471,7 @@ int main(int argc, char** argv) {
 
   if (FLAGS_workload == "test") {
     // options.use_direct_io_for_flush_and_compaction = true;
-    options.use_direct_reads = true;
+    // options.use_direct_reads = true;
   }
   options.statistics = rocksdb::CreateDBStatistics();
   options.advise_random_on_open = false;
@@ -713,63 +484,51 @@ int main(int argc, char** argv) {
     return 1;
   }
   // estimate db size
-  db->GetIntProperty(rocksdb::DB::Properties::kTotalSstFilesSize, &db_size);
-  Cache* cache = nullptr;
+  db->GetIntProperty(rocksdb::DB::Properties::kEstimateNumKeys, &num_keys);
+  num_keys /= 1.1;
+  max_key = num_keys;
+  std::cout << "num_keys: " << num_keys << std::endl;
   int cache_capacity = 0;
 
   if (FLAGS_workload == "test" && FLAGS_cache_size > 0) {
     cache_capacity = FLAGS_cache_size;
+    if (FLAGS_cache_style == "adcache") 
+      cache_capacity /= 2;
   }
   std::cout << "cache_capacity: " << cache_capacity << " entries" << std::endl;
   std::cout << "cache style: " << FLAGS_cache_style << std::endl;
-  if (cache_capacity > 0) {
-    if (FLAGS_cache_style == "LRU") {
-      cache = new LRUCache(cache_capacity);
-    } else if (FLAGS_cache_style == "ELRU") {
-      cache = new ELRU(cache_capacity, 20);
-    }
-    else if (FLAGS_cache_style == "range") {
-      cache = new RangeCache(cache_capacity);
-    } else if (FLAGS_cache_style == "lecar") {
-      cache = new RangeCache_LeCaR(cache_capacity);
-    } else if (FLAGS_cache_style == "RLCache") {
-      // cache = new RLCache(cache_capacity * 15 / 16);
-      cache = new RLCache(cache_capacity / 2);
-    } else if (FLAGS_cache_style == "block" || FLAGS_cache_style == "heap") {
-      cache = nullptr;
-    } else if (FLAGS_cache_style == "cacheus") {
-      cache = new RangeCache_Cacheus(cache_capacity);
-    } else {
-      std::cerr << "Unknown cache style: " << FLAGS_cache_style << std::endl;
-      return 1;
-    }
-    if (cache) std::cout << "cache name: " << cache->name() << std::endl;
-  }
+  auto cache = ShardedCacheBuilder::BuildShardedCache(
+    (K)0, // start key
+    (K)1e8, // end key
+    cache_capacity,
+    NUM_SHARDS,
+    FLAGS_cache_style
+  );
+  if (cache) 
+    std::cout << "cache name: " << cache.value().name << std::endl;
+  
 
-  TestStats test_stats;
   if (FLAGS_workload == "prepare") {
-    FileWorkload(db, test_stats, nullptr, &out);
+    FileWorkload(db, std::ref(cache), &out);
     // PrepareDB_ingestion(db, options);
   } else if (FLAGS_workload == "test") {
-    if (FLAGS_cache_style == "RLCache") {
-      std::thread trainworker(train_worker_function);
-      // FileWorkload(db, test_stats, cache, &out);
-      start_test_workers(db, test_stats, cache, &out);
+    if (FLAGS_cache_style == "adcache") {
+      learning_stats.cache_to_db_ratio = (float)cache_capacity / num_keys;
+      std::thread trainworker(train_worker_function, db, cache_capacity, FLAGS_kvsize, std::ref(cache), &out);
+      start_test_workers(db, std::ref(cache), &out);
       exit_train_worker.store(true);
-      sem.release();  // Release in case the worker is waiting.
+      sem.trigger();  // Release in case the worker is waiting.
       trainworker.join();
     } else {
-      // FileWorkload(db, test_stats, cache, &out);
-      start_test_workers(db, test_stats, cache, &out);
+      start_test_workers(db, std::ref(cache), &out);
     }
   }
   std::string stat;
   db->GetProperty("rocksdb.stats", &stat);
   std::cout << stat << std::endl;
   std::cout << "statistics: " << options.statistics->ToString() << std::endl;
-  std::cout << counter << std::endl;
   if (FLAGS_workload == "test") {
-    out << "cache size: " << (cache ? cache->get_capacity() : 0) << std::endl;
+    out << "cache size: " << (cache ? cache->get_capacity(): 0) << std::endl;
     out << "block cache size: " << options.extern_options->block_cache->GetCapacity()
         << std::endl;
     out << "block cache ratio: " << (float) options.extern_options->block_cache->GetCapacity() / FLAGS_kvsize / FLAGS_cache_size << endl;
@@ -793,17 +552,11 @@ int main(int argc, char** argv) {
   }
   out.close();
 
-  auto block_cache =
-      options.extern_options ? options.extern_options->block_cache : nullptr;
-  // if (block_cache) {
-  //   auto c = block_cache.get();
-  //   string name = c->Name();
-  //   if (name == "HeapCache") c->Lookup("report");
-  // }
+  auto block_cache = options.extern_options ? options.extern_options->block_cache : nullptr;
   auto heapcacheshard = extract_heapcacheshard(block_cache);
   if (heapcacheshard) heapcacheshard->report();
   db->Close();
   delete db;
-  if (cache) delete cache;
+
   return 0;
 }
