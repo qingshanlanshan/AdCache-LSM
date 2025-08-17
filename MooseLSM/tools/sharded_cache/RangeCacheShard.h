@@ -45,8 +45,7 @@ class RangeCacheShard : public CacheShardBase {
         // look for hint node
         auto hint_it = map_.find(*hint);
         if (hint_it == map_.end()) {
-          // should not happen
-          return false;
+          throw std::runtime_error("Hint not found in map");
         }
         SkipList::Node* hint_node = nullptr;
         hint_node = promote_to_node(hint_it->first, hint_it->second);
@@ -75,8 +74,7 @@ class RangeCacheShard : public CacheShardBase {
       } else {
         auto hint_it = map_.find(*hint);
         if (hint_it == map_.end()) {
-          // should not happen
-          return false;
+          throw std::runtime_error("Hint not found in map");
         }
         // update previous node
         SkipList::Node* hint_node = nullptr;
@@ -106,7 +104,7 @@ class RangeCacheShard : public CacheShardBase {
     } else {
       it->second = std::make_shared<V>(value);
     }
-    request(key);
+    // request(key);
     return true;
   }
 
@@ -150,6 +148,11 @@ class RangeCacheShard : public CacheShardBase {
     return capacity_;
   }
 
+  bool warmup_done() const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return eviction_policy_->warmup_done();
+  }
+
  private:
   using Entry = std::variant<SkipList::Node*, std::shared_ptr<V>>;
 
@@ -170,10 +173,12 @@ class RangeCacheShard : public CacheShardBase {
   void remove(K key) {
     // assert lock is held
     auto it = map_.find(key);
-    if (it == map_.end()) return;
+    if (it == map_.end()) throw std::runtime_error("Key not found in map");
     SkipList::Node* node = nullptr;
     if (std::holds_alternative<SkipList::Node*>(it->second)) {
       node = std::get<SkipList::Node*>(it->second);
+      if (node->prev)
+        node->prev->next_key = false;
       skip_list_.remove(node);
     }
     map_.erase(it);

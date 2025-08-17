@@ -34,6 +34,7 @@ def get_config(config_file: str) -> list[Workload]:
 def get_db(db_size: int) -> list[str]:
     # key format: "000...0123", length = 16
     db = [str(i).zfill(16) for i in range(db_size)]
+    random.shuffle(db)
     print(f"Database size: {len(db)}")
     print(f"First 10 keys: {db[:10]}")
     return db
@@ -86,7 +87,7 @@ def generate_workload(dist, workload: Workload, db: list[str], output_files: lis
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
-    parser.add_argument('--key-range', type=int, required=True, help='query key range')
+    parser.add_argument('--key-range', type=int, default=100_000_000, help='query key range')
     parser.add_argument('--output', type=str, required=True)
     parser.add_argument('--file-num', type=int, default=1, help='queries are split into this many files')
     args = parser.parse_args()

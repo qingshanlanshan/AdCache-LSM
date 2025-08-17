@@ -49,6 +49,8 @@ class ShardedCacheBase {
     return shard ? shard->scan(start_key, length) : 0;
   }
 
+  // the functions below are for adcache, others might not be implemented
+
   void set_capacity(size_t capacity) {
     for (auto& [_, shard] : shards_) {
       shard->set_capacity(capacity / shards_.size());

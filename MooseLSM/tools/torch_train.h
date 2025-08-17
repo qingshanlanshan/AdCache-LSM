@@ -78,15 +78,6 @@ void sync_model_cache(rocksdb::DB* db = nullptr,
                       std::ostream* out = &std::cout) {
   if (!db || !cache || cache->name != "adcache") return;
 
-  auto statistics = db->GetOptions().statistics;
-  auto hit_count =
-      statistics->getAndResetTickerCount(rocksdb::BLOCK_CACHE_DATA_HIT);
-  auto miss_count =
-      statistics->getAndResetTickerCount(rocksdb::BLOCK_CACHE_DATA_MISS);
-  stats.n_block_get = hit_count + miss_count;
-  stats.n_block_hit = hit_count;
-  stats.n_block_miss = miss_count;
-
   bool warmup_done = cache->warmup_done();
   learning_stats.warmup_done = cache->warmup_done();
   
@@ -219,10 +210,18 @@ void update() {
   double new_smoothed_hitrate = cur_hitrate * 0.1 + smoothed_hitrate * 0.9;
   double reward = (new_smoothed_hitrate - smoothed_hitrate) / smoothed_hitrate;
   smoothed_hitrate = new_smoothed_hitrate;
+  double reward_clipped = std::clamp(reward, -1.0, 1.0);
+  ACTOR_LR *= (1.0 - 0.1 * reward_clipped);
+  ACTOR_LR = std::clamp(ACTOR_LR, 1e-6, 1e-2);
+  for (auto& group : actor_optimizer.param_groups()) {
+    group.options().set_lr(ACTOR_LR);
+  }
+
   if (LOGGING) {
     std::cout << "cur_hitrate: " << cur_hitrate << std::endl;
     std::cout << "smoothed_hitrate: " << smoothed_hitrate << std::endl;
     std::cout << "Reward: " << reward << std::endl;
+    std::cout << "Actor LR: " << ACTOR_LR << std::endl;
   }
   // unlikely
   while (workload_vector.size() < WORKLOAD_DIM) workload_vector.push_back(0.0);

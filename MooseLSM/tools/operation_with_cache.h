@@ -99,7 +99,6 @@ rocksdb::Status scan_with_cache(rocksdb::DB* db, std::optional<ShardedCacheBase>
   size_t key = std::stoull(key_string);
   stats.OP_count++;
   stats.n_scan++;
-  stats.scan_length += length;
   size_t count = 0;
 
   if (cache) {
@@ -108,9 +107,12 @@ rocksdb::Status scan_with_cache(rocksdb::DB* db, std::optional<ShardedCacheBase>
     auto duration = chrono::duration_cast<chrono::microseconds>(chrono::steady_clock::now() - start).count();
     stats.scan_time += duration;
     stats.OP_time += duration;
-    stats.length_in_cache += length;
-    stats.n_in_cache++;
     stats.time_in_cache += duration;
+    if (count > 0) {
+      stats.length_in_cache += count;
+      stats.n_in_cache++;
+      stats.scan_length += count;
+    }
     if (count >= length) {
       return rocksdb::Status::OK();
     }
@@ -123,12 +125,14 @@ rocksdb::Status scan_with_cache(rocksdb::DB* db, std::optional<ShardedCacheBase>
   auto start = chrono::steady_clock::now();
   auto iter = db->NewIterator(rocksdb::ReadOptions());
   iter->Seek(scan_key);
-  for (size_t i = count + 1; i < length && iter->Valid(); i++) {
-    iter->Next();
-    if (iter->Valid() && i - count <= cache_limit) {
-      std::string value = iter->value().ToString();
-      if (cache) 
-        cache->put(key + i, value, key + i - 1);
+  for (size_t i = 0; i < length - count; ++i, ++key, iter->Next()) {
+    if (!iter->Valid()) break;
+    std::string value = iter->value().ToString();
+    if (cache) {
+      if (i == 0 && count == 0)
+        cache->put(key, value);
+      else
+        cache->put(key, value, key - 1);
     }
   }
   delete iter;
@@ -136,6 +140,7 @@ rocksdb::Status scan_with_cache(rocksdb::DB* db, std::optional<ShardedCacheBase>
   auto duration = chrono::duration_cast<chrono::microseconds>(chrono::steady_clock::now() - start).count();
   stats.scan_time += duration;
   stats.OP_time += duration;
+  stats.scan_length += length - count;
   stats.length_in_db += length - count;
   stats.n_in_db++;
   stats.time_in_db += duration;

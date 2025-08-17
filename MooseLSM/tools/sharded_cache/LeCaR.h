@@ -1,170 +1,197 @@
-#include "EvictionPolicy.h"
-#include <deque>
+#pragma once
+
+#include "DequeDict.h"
+#include "HeapDict.h"
 #include <unordered_map>
-#include <queue>
-#include <optional>
+#include <cassert>
+#include <iostream>
 #include <cmath>
 #include <random>
+#include <array>
 
-class LeCaR : public EvictionPolicy {
-public:
-    LeCaR(size_t capacity)
-        : EvictionPolicy(capacity), cache_size(capacity), history_size(capacity / 2),
-          W{0.5f, 0.5f}, learning_rate(0.45f),
-          discount_rate(std::pow(0.005f, 1.0f / capacity)), time(0) {
-        rng.seed(123);
-    }
-
-    std::optional<K> request(K key) override {
-        ++time;
-        if (cache.count(key)) {
-            hit(key);
-            return std::nullopt;
-        } else {
-            return miss(key);
-        }
-    }
-
-    std::vector<K> set_capacity(size_t capacity) override {
-        std::vector<K> evicted_keys;
-        cache_size = capacity;
-        history_size = capacity / 2;
-        return evicted_keys;  // nothing forcibly evicted
-    }
-
-    bool warmup_done() override {
-        return cache.size() >= cache_size;
-    }
-
+class LeCaR_Policy {
 private:
     struct Entry {
-        K key;
-        int freq;
-        size_t time;
-        size_t evicted_time;
+        size_t oblock_;
+        int freq_;
+        size_t time_;
+        std::optional<size_t> evicted_time;
+
+        Entry(size_t oblock, int freq, size_t time)
+            : oblock_(oblock), freq_(freq), time_(time), evicted_time(std::nullopt) {}
 
         bool operator<(const Entry& other) const {
-            return freq > other.freq || (freq == other.freq && time > other.time);
+            if (freq_ == other.freq_) return oblock_ < other.oblock_;
+            return freq_ < other.freq_;
         }
     };
 
-    size_t cache_size;
-    size_t history_size;
-    float W[2];
-    float learning_rate;
+    size_t time = 0;
+    size_t cache_size_;
+
+    DequeDict<size_t, Entry> lru;
+    HeapDict<size_t, Entry> lfu;
+
+    DequeDict<size_t, Entry> lru_hist;
+    DequeDict<size_t, Entry> lfu_hist;
+
+    float initial_weight = 0.5f;
+    float learning_rate = 0.45f;
     float discount_rate;
-    size_t time;
-    std::default_random_engine rng;
+    std::array<float, 2> W;
+
+    std::mt19937 rng{123};
     std::uniform_real_distribution<float> dist{0.0f, 1.0f};
 
-    std::unordered_map<K, Entry> cache;
-    std::unordered_map<K, Entry> lru_hist, lfu_hist;
-    std::deque<K> lru_order;
-    std::priority_queue<Entry> lfu_heap;
+public:
+    explicit LeCaR_Policy(size_t cache_size)
+        : cache_size_(cache_size),
+          discount_rate(std::pow(0.005f, 1.0f / cache_size)),
+          W{initial_weight, 1.0f - initial_weight} {}
 
-    bool in_lfu(const K& key) {
-        return cache.find(key) != cache.end();
+    bool contains(size_t oblock) const {
+        return lru.contains(oblock);
     }
 
-    void hit(K key) {
-        auto& entry = cache[key];
-        entry.freq++;
-        entry.time = time;
-        lru_order.erase(std::find(lru_order.begin(), lru_order.end(), key));
-        lru_order.push_back(key);
-        lfu_heap.push(entry);
+    bool cacheFull() const {
+        return lru.size() == cache_size_;
     }
 
-    std::optional<K> miss(K key) {
-        int freq = 1;
-        if (lru_hist.count(key)) {
-            freq = lru_hist[key].freq + 1;
-            float reward = -std::pow(discount_rate, time - lru_hist[key].evicted_time);
-            adjust_weights(reward, 0);
-            lru_hist.erase(key);
-        } else if (lfu_hist.count(key)) {
-            freq = lfu_hist[key].freq + 1;
-            float reward = -std::pow(discount_rate, time - lfu_hist[key].evicted_time);
-            adjust_weights(0, reward);
-            lfu_hist.erase(key);
+    void addToCache(size_t oblock, int freq) {
+        Entry x(oblock, freq, time);
+        lru.set(oblock, x);
+        lfu.set(oblock, x);
+    }
+
+    void addToHistory(const Entry& x, int policy) {
+        DequeDict<size_t, Entry>* policy_history = nullptr;
+        if (policy == 0) policy_history = &lru_hist;
+        else if (policy == 1) policy_history = &lfu_hist;
+        else return;
+
+        if (policy_history->size() == cache_size_) {
+            const Entry& evicted = policy_history->first();
+            policy_history->erase(evicted.oblock_);
         }
-
-        std::optional<K> evicted;
-        if (cache.size() >= cache_size) {
-            evicted = evict();
-        }
-
-        Entry new_entry{key, freq, time, 0};
-        cache[key] = new_entry;
-        lru_order.push_back(key);
-        lfu_heap.push(new_entry);
-
-        return evicted;
+        policy_history->set(x.oblock_, x);
     }
 
-    K get_lru() {
-        return lru_order.front();
+    Entry getLRU(DequeDict<size_t, Entry>& dict) const {
+        return dict.first();
     }
 
-    Entry get_lfu() {
-        while (!lfu_heap.empty() && !cache.count(lfu_heap.top().key)) {
-            lfu_heap.pop();
-        }
-        return lfu_heap.top();
+    Entry getHeapMin() const {
+        return lfu.min();
     }
 
-    int get_choice() {
+    int getChoice() {
         return dist(rng) < W[0] ? 0 : 1;
     }
 
-    K evict() {
-        K lru_key = get_lru();
-        Entry lfu_entry = get_lfu();
+    std::pair<std::optional<size_t>, int> evict() {
+        Entry lru_entry = getLRU(lru);
+        Entry lfu_entry = getHeapMin(); 
 
-        int policy = get_choice();
-        K victim;
+        Entry evicted = lru_entry;
+        int policy = getChoice();
 
-        if (lru_key == lfu_entry.key) {
-            victim = lru_key;
+        if (&lru_entry == &lfu_entry) {
             policy = -1;
-        } else {
-            victim = (policy == 0) ? lru_key : lfu_entry.key;
-        }
-
-        Entry evicted_entry = cache[victim];
-        evicted_entry.evicted_time = time;
-        cache.erase(victim);
-        lru_order.erase(std::find(lru_order.begin(), lru_order.end(), victim));
-
-        if (policy == 0) {
-            insert_history(lru_hist, victim, evicted_entry);
         } else if (policy == 1) {
-            insert_history(lfu_hist, victim, evicted_entry);
+            evicted = lfu_entry;
         }
 
-        return victim;
+        lru.erase(evicted.oblock_);
+        lfu.erase(evicted.oblock_);
+
+        Entry x = evicted;
+        x.evicted_time = time;
+        addToHistory(x, policy);
+
+        return {x.oblock_, policy};
     }
 
-    void insert_history(std::unordered_map<K, Entry>& hist, K key, Entry entry) {
-        if (hist.size() >= history_size) {
-            auto oldest = hist.begin();
-            for (auto it = hist.begin(); it != hist.end(); ++it) {
-                if (it->second.time < oldest->second.time) {
-                    oldest = it;
-                }
-            }
-            hist.erase(oldest);
+    void hit(size_t oblock) {
+        Entry x = lru.get(oblock);
+        x.time_ = time;
+        x.freq_ += 1;
+        lru.set(oblock, x);
+        lfu.set(oblock, x);
+    }
+
+    void adjustWeights(float rewardLRU, float rewardLFU) {
+        float reward[2] = {rewardLRU, rewardLFU};
+        W[0] *= std::exp(learning_rate * reward[0]);
+        W[1] *= std::exp(learning_rate * reward[1]);
+        float sum = W[0] + W[1];
+        W[0] /= sum;
+        W[1] /= sum;
+
+        if (W[0] >= 0.99f) W = {0.99f, 0.01f};
+        else if (W[1] >= 0.99f) W = {0.01f, 0.99f};
+    }
+
+    std::optional<size_t> miss(size_t oblock) {
+        std::optional<size_t> evicted;
+        int freq = 1;
+
+        if (lru_hist.contains(oblock)) {
+            Entry entry = lru_hist.get(oblock);
+            freq = entry.freq_ + 1;
+            lru_hist.erase(oblock);
+            float reward = -std::pow(discount_rate, time - *entry.evicted_time);
+            adjustWeights(reward, 0);
+        } else if (lfu_hist.contains(oblock)) {
+            Entry entry = lfu_hist.get(oblock);
+            freq = entry.freq_ + 1;
+            lfu_hist.erase(oblock);
+            float reward = -std::pow(discount_rate, time - *entry.evicted_time);
+            adjustWeights(0, reward);
         }
-        hist[key] = entry;
+
+        if (lru.size() == cache_size_) {
+            auto [evict_block, _] = evict();
+            evicted = evict_block;
+        }
+
+        addToCache(oblock, freq);
+        return evicted;
     }
 
-    void adjust_weights(float r_lru, float r_lfu) {
-        float e_lru = std::exp(learning_rate * r_lru);
-        float e_lfu = std::exp(learning_rate * r_lfu);
-        float sum = W[0] * e_lru + W[1] * e_lfu;
-        W[0] = (W[0] * e_lru) / sum;
-        W[1] = (W[1] * e_lfu) / sum;
-        if (W[0] > 0.99f) W[0] = 0.99f, W[1] = 0.01f;
-        if (W[1] > 0.99f) W[1] = 0.99f, W[0] = 0.01f;
+    std::pair<bool, std::optional<size_t>> request(size_t oblock) {
+        time++;
+        if (contains(oblock)) {
+            hit(oblock);
+            return {false, std::nullopt};
+        } else {
+            return {true, miss(oblock)};
+        }
     }
+};
+
+
+class LeCaR : public EvictionPolicy {
+ public:
+  explicit LeCaR(size_t capacity)
+      : EvictionPolicy(capacity), policy_(LeCaR_Policy(capacity)) {}
+
+  // Touch/insert a key. If inserting and over capacity, evict LRU and return
+  // it.
+  std::optional<K> request(K key) override {
+    auto [_, evicted] = policy_.request(key);
+    return evicted;
+  }
+
+  // Change capacity; evict oldest until within capacity. Return all evicted
+  // keys.
+  std::vector<K> set_capacity(size_t capacity) override {
+    return std::vector<K>();
+  }
+
+  bool warmup_done() override {
+    return true;
+  }
+
+ private:
+    LeCaR_Policy policy_;  // LeCaR policy instance
 };

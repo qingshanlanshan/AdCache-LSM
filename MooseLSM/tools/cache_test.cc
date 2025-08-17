@@ -44,6 +44,7 @@ size_t max_possible_scan_len = 64;
 K min_key = 0;
 K max_key = 1e8;
 size_t num_keys = 0;
+size_t num_levels = 0;
 auto launch_time = chrono::steady_clock::now();
 
 enum OperationType { GET, PUT, DELETE, SCAN };
@@ -176,22 +177,30 @@ void PrepareDB_ingestion(rocksdb::DB* db, rocksdb::Options options) {
   }
 }
 
-void dump_stats(std::ofstream& out, size_t n_levels, bool block_cache = false) {
-  if (stats.OP_count == 0) {
-    stats.OP_count = 100000;
+int get_level_number(rocksdb::DB* db) {
+  std::string stat;
+  int level_number = 0;
+  for (int i = 1; i < db->NumberLevels(); i++) {
+    db->GetProperty("rocksdb.num-files-at-level" + std::to_string(i), &stat);
+    if (stat != "0") level_number++;
   }
+  return level_number;
+}
+
+float dump_stats(std::ofstream& out, bool block_cache = false) {
+  auto hit_rate = stats.get_hitrate(num_levels);
   auto op_time = stats.OP_time / stats.OP_count;
   out << "OP time: " << op_time << std::endl;
-  out << "hit rate: " << stats.get_hitrate(n_levels) << std::endl;
+  out << "hit rate: " << hit_rate << std::endl;
   out << "kv hit rate: " << (double)stats.n_hit / stats.n_get
       << std::endl;
   out << "scan hit rate: "
       << (double)stats.length_in_cache /
              (stats.length_in_cache + stats.length_in_db)
       << std::endl;
-  out << "block hits: "
-      << (double)stats.n_block_hit / (stats.n_scan * (n_levels + 1))
-      << std::endl;
+  // out << "block hits: "
+  //     << (double)stats.n_block_hit / (stats.n_scan * (n_levels + 1))
+  //     << std::endl;
   out << "get time: " << (double)stats.get_time / stats.n_get
       << std::endl;
   out << "put time: " << (double)stats.put_time / stats.n_put
@@ -203,6 +212,7 @@ void dump_stats(std::ofstream& out, size_t n_levels, bool block_cache = false) {
   out << "cache scan time: "
       << (double)stats.time_in_cache / (stats.length_in_cache + 1)
       << std::endl;
+  return hit_rate;
 }
 
 rocksdb::heap_cache::HeapCacheShard* extract_heapcacheshard(shared_ptr<rocksdb::Cache> block_cache, int i = 0)
@@ -240,7 +250,6 @@ void FileWorkload(rocksdb::DB* db, std::optional<ShardedCacheBase>& cache, std::
   } baseline;
   unordered_map<string, size_t> key_freq_map;
   size_t total_freq = 0;
-  size_t n_levels = db->GetOptions().num_levels;
   string filename = FLAGS_workload_file;
   if (file_idx >= 0) {
     filename += "_" + std::to_string(file_idx);
@@ -251,11 +260,10 @@ void FileWorkload(rocksdb::DB* db, std::optional<ShardedCacheBase>& cache, std::
   while (std::getline(file, line)) {
     num_operations++;
   }
-  std::cout << "num queries: " << num_operations << std::endl;
   file.clear();
   file.seekg(0, std::ios::beg);
   
-  cout << "start testing" << endl;
+  cout << "Workload starts with " << num_operations << " operations from file " << filename << endl;
   size_t idx = 0;
   while (std::getline(file, line)) {
     idx++;
@@ -292,10 +300,18 @@ void FileWorkload(rocksdb::DB* db, std::optional<ShardedCacheBase>& cache, std::
     
 
     if (idx % print_window_size == 0 && out && file_idx <= 0) {
-      dump_stats(*out, n_levels, FLAGS_cache_style == "block");
+      auto statistics = db->GetOptions().statistics;
+      auto hit_count = statistics->getAndResetTickerCount(rocksdb::BLOCK_CACHE_DATA_HIT);
+      auto miss_count = statistics->getAndResetTickerCount(rocksdb::BLOCK_CACHE_DATA_MISS);
+      // since the number of levels changes over time, update during the run
+      num_levels = get_level_number(db);
+      stats.n_block_get = hit_count + miss_count;
+      stats.n_block_hit = hit_count;
+      stats.n_block_miss = miss_count;
+      auto hit_rate = dump_stats(*out, FLAGS_cache_style == "block");
       {
         std::unique_lock<std::shared_mutex> lock(vector_mutex);
-        hit_rates.push_back(stats.get_hitrate(n_levels));
+        hit_rates.push_back(hit_rate);
       }
       stats.reset();
     }
@@ -350,12 +366,17 @@ void FileWorkload(rocksdb::DB* db, std::optional<ShardedCacheBase>& cache, std::
 
     if (idx % max(1, (int)(num_operations / 10)) == 0)
     {
+      // current date and time
+      auto current_date = chrono::system_clock::now();
+      auto current_time = chrono::system_clock::to_time_t(current_date);
+      std::cout << std::ctime(&current_time);
+      // time since launch
       auto time_since_launch = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - launch_time).count();
       // human readable time
-      std::cout << "Time since launch: " << time_since_launch / 3600 << "h "
+      std::cout << "Progress: " << (idx * 100) / num_operations << "% "
+                << "Time since launch: " << time_since_launch / 3600 << "h "
                 << (time_since_launch % 3600) / 60 << "m "
-                << time_since_launch % 60 << "s \t";
-      std::cout << "Progress: " << (idx * 100) / num_operations << "%\r";
+                << time_since_launch % 60 << "s " << std::endl;
       std::cout.flush();
     }
   }
@@ -371,14 +392,15 @@ void set_table_options(rocksdb::Options& options) {
   table_options->block_size = 4096;
   table_options->max_auto_readahead_size = 0;
   table_options->checksum = rocksdb::kNoChecksum;
+  size_t shard_bits = std::log2(NUM_SHARDS);
   if (FLAGS_cache_style == "block") {
-    auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize, NUM_SHARDS);
+    auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize, shard_bits);
     table_options->block_cache = block_cache;
     options.extern_options->block_cache = block_cache;
   }
   else if (FLAGS_cache_style == "adcache")
   {
-    auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize / 2, NUM_SHARDS);
+    auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize / 2, shard_bits);
     table_options->block_cache = block_cache;
     options.extern_options->block_cache = block_cache;
   }
@@ -398,8 +420,6 @@ rocksdb::Options get_default_options() {
   options.level_compaction_dynamic_level_bytes = false;
   options.level0_slowdown_writes_trigger = 4;
   options.level0_stop_writes_trigger = 8;
-  options.max_bytes_for_level_base =
-      options.max_bytes_for_level_base * options.max_bytes_for_level_multiplier;
   set_table_options(options);
   return options;
 }
@@ -487,19 +507,24 @@ int main(int argc, char** argv) {
   db->GetIntProperty(rocksdb::DB::Properties::kEstimateNumKeys, &num_keys);
   num_keys /= 1.1;
   max_key = num_keys;
-  std::cout << "num_keys: " << num_keys << std::endl;
-  int cache_capacity = 0;
+  std::cout << "num_keys: " << num_keys 
+            << " max_key: " << max_key << std::endl;
 
+  int cache_capacity = 0;
   if (FLAGS_workload == "test" && FLAGS_cache_size > 0) {
     cache_capacity = FLAGS_cache_size;
     if (FLAGS_cache_style == "adcache") 
       cache_capacity /= 2;
   }
-  std::cout << "cache_capacity: " << cache_capacity << " entries" << std::endl;
-  std::cout << "cache style: " << FLAGS_cache_style << std::endl;
+  std::cout << "Cache params:\n"
+            << "\tmin_key: " << min_key << "\n"
+            << "\tmax_key: " << max_key << "\n"
+            << "\tcache_capacity: " << cache_capacity << "\n"
+            << "\tnum_shards: " << NUM_SHARDS << "\n"
+            << "\tcache_style: " << FLAGS_cache_style << std::endl;
   auto cache = ShardedCacheBuilder::BuildShardedCache(
-    (K)0, // start key
-    (K)1e8, // end key
+    (K)min_key,
+    (K)max_key,
     cache_capacity,
     NUM_SHARDS,
     FLAGS_cache_style
@@ -544,8 +569,7 @@ int main(int argc, char** argv) {
         << std::endl;
     rocksdb::HistogramData hist;
     options.statistics->histogramData(rocksdb::DB_GET, &hist);
-    auto db_get_time = hist.average;
-    out << "db get time: " << db_get_time << std::endl;
+    out << "db get time: " << hist.average << std::endl;
     options.statistics->histogramData(rocksdb::SST_READ_MICROS, &hist);
     out << "sst read time: " << hist.average << std::endl;
     out << "sst read count: " << hist.count << std::endl;

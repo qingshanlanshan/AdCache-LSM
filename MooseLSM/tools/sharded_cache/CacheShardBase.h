@@ -18,9 +18,7 @@ public:
   virtual void set_capacity(size_t capacity) = 0;
   virtual size_t get_capacity() const = 0;
 
-  bool warmup_done() const {
-    return policy_->warmup_done();
-  }
+  virtual bool warmup_done() const {return true;}
 
   CacheShardBase(const CacheShardBase&) = delete;
   CacheShardBase& operator=(const CacheShardBase&) = delete;
