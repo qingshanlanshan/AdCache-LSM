@@ -182,16 +182,6 @@ class LeCaR : public EvictionPolicy {
     return evicted;
   }
 
-  // Change capacity; evict oldest until within capacity. Return all evicted
-  // keys.
-  std::vector<K> set_capacity(size_t capacity) override {
-    return std::vector<K>();
-  }
-
-  bool warmup_done() override {
-    return true;
-  }
-
  private:
     LeCaR_Policy policy_;  // LeCaR policy instance
 };

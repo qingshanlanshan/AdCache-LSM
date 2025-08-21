@@ -3,6 +3,8 @@
 # WORKLOAD=long_scan
 # WORKLOAD=balanced
 WORKLOAD=dynamic
+# WORKLOAD=skewness
+# WORKLOAD=shift
 # WORKLOAD=test
 
 cd workload

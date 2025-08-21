@@ -15,10 +15,11 @@ public:
   virtual bool put(K key, const V& value, std::optional<K> hint = std::nullopt) = 0;
   virtual bool update(K key, const V& value) = 0;
   virtual size_t scan(K start_key, size_t length) = 0;
+  // AdCache specific
   virtual void set_capacity(size_t capacity) = 0;
   virtual size_t get_capacity() const = 0;
-
   virtual bool warmup_done() const {return true;}
+  virtual std::optional<K> peek_victim() { return std::nullopt; }
 
   CacheShardBase(const CacheShardBase&) = delete;
   CacheShardBase& operator=(const CacheShardBase&) = delete;

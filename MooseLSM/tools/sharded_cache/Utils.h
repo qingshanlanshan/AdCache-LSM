@@ -16,7 +16,11 @@
 using K = size_t;
 using V = std::string;
 
-const int NUM_SHARDS = 64;
+const bool ENABLE_ADMISSION_CONTROL = true;
+const bool ENABLE_ADAPTIVE_PARTITIONING = true;
+const bool ENABLE_DIRECTIO = false;
+
+const int NUM_SHARDS = 1;
 const int MAX_SCAN_LENGTH = 64;
 const int RANGE_COUNT = 1;
 const int WORKLOAD_DIM = RANGE_COUNT + 4;  // Workload input dimension.
@@ -26,7 +30,7 @@ const int CACHE_PARAM_DIM = RANGE_COUNT * 2 + 2;  // Current cache parameters di
 const int STATE_DIM = WORKLOAD_DIM;
 const int ACTION_DIM = CACHE_PARAM_DIM;  // We'll adjust the cache parameters continuously.
 const int HIDDEN_DIM = 640;
-double ACTOR_LR = 1e-4;
+double ACTOR_LR = 1e-3;
 const double CRITIC_LR = 1e-3;
 const double GAMMA = 0.99;
 const int NUM_STEPS = 1;
@@ -36,7 +40,7 @@ int n_updates = 0;
 // updated by training thread
 // 0～-3: range lookup param
 // -2: point lookup param
-// -1: block cache size
+// -1: range cache size
 std::vector<float> cache_params_vector(CACHE_PARAM_DIM, 1.0);
 std::vector<float> hit_rates;
 std::shared_mutex vector_mutex;

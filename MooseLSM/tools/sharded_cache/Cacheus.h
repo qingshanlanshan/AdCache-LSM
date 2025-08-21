@@ -240,14 +240,6 @@ class Cacheus : public EvictionPolicy {
     return evicted;
   }
 
-  std::vector<K> set_capacity(size_t capacity) override {
-    return std::vector<K>();
-  }
-
-  bool warmup_done() override {
-    return true;
-  }
-
  private:
     Cacheus_Policy policy_;
 };

@@ -78,10 +78,8 @@ void sync_model_cache(rocksdb::DB* db = nullptr,
                       std::ostream* out = &std::cout) {
   if (!db || !cache || cache->name != "adcache") return;
 
-  bool warmup_done = cache->warmup_done();
   learning_stats.warmup_done = cache->warmup_done();
-  
-  if (warmup_done) {
+  if (learning_stats.warmup_done) {
 // sync cache capacity
 #if 1
     float cache_ratio = 0;
@@ -93,29 +91,26 @@ void sync_model_cache(rocksdb::DB* db = nullptr,
     // gradually change the cache size to avoid too much eviction
     cache_ratio = cache_ratio * 0.2 + 0.8 * cache->get_capacity() / max_cache_size;
     std::clamp(cache_ratio, 0.01f, 0.99f);
-    // if (learning_stats.n_scan == 0) {
-    //   cache_ratio = (float)cache->get_capacity() / FLAGS_cache_size;
-    //   cache_ratio = max((float)0.1, cache_ratio);
-    //   if (rl_cache->get_size() >= rl_cache->get_capacity() * 0.9)
-    //     cache_ratio = min(1.0, cache_ratio + 0.1);
-    // } else {
-    //   cache_ratio *= 0.94;
-    // }
+    if (learning_stats.n_scan == 0) {
+      cache_ratio = (float)cache->get_capacity() / max_cache_size;
+      cache_ratio = std::max((float)0.1, cache_ratio);
+      if (cache->warmup_done())
+        cache_ratio = std::min(1.0, cache_ratio + 0.1);
+    } else {
+      cache_ratio *= 0.94;
+    }
 
-    // maybe stablize
-#if 1
-    if (cache_ratio < 0.02)
-      cache_ratio = 0;
-    else if (cache_ratio > 0.98)
-      cache_ratio = 1;
-#endif
+    // cache_ratio = 0 or 1 may cause unexpected behaviour
+    cache_ratio = std::clamp(cache_ratio, 0.01f, 0.99f);
+
     // update cache
-    float cur_blockcache_ratio = 1 - cache_ratio;
-    {
-      cache->set_capacity((size_t)(cache_ratio * max_cache_size)); 
+    if (ENABLE_ADAPTIVE_PARTITIONING) {
+      float cur_blockcache_ratio = 1 - cache_ratio;
+      cache->set_capacity((size_t)(cache_ratio * max_cache_size));
       auto blockcache = db->GetOptions().extern_options->block_cache;
       size_t size = cur_blockcache_ratio * max_cache_size * kvsize;
       blockcache->SetCapacity(size);
+      std::cout << "blockcache ratio: " << cur_blockcache_ratio << std::endl;
     }
     // update model
     {
@@ -125,8 +120,7 @@ void sync_model_cache(rocksdb::DB* db = nullptr,
       cur_hitrate = std::accumulate(hit_rates.begin(), hit_rates.end(), 0.0) / hit_rates.size();
       hit_rates.clear();
     }
-    std::cout << "blockcache ratio: " << cur_blockcache_ratio << std::endl;
-    *out << "blockcache ratio: " << cur_blockcache_ratio << std::endl;
+    // *out << "blockcache ratio: " << cur_blockcache_ratio << std::endl;
 #endif
   }
   // reset

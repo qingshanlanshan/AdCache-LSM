@@ -383,7 +383,7 @@ void BlockBasedTableIterator::InitDataBlock() {
       string cache_name = block_cache->Name();
       if (cache_name == "HeapCache")
         use_heap_cache = true;
-      if (read_options_.extern_options && read_options_.extern_options->cache_style == "RLCache")
+      if (read_options_.extern_options && read_options_.extern_options->cache_style == "adcache")
         use_rl_cache = true;
       (void)use_rl_cache;(void)use_heap_cache;
       if (use_rl_cache || use_heap_cache)

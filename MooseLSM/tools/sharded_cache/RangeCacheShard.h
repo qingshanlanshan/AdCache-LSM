@@ -45,7 +45,10 @@ class RangeCacheShard : public CacheShardBase {
         // look for hint node
         auto hint_it = map_.find(*hint);
         if (hint_it == map_.end()) {
-          throw std::runtime_error("Hint not found in map");
+          // cross-shard hint won't be able to find
+          put(key, value, std::nullopt);
+          return true;
+          // throw std::runtime_error("Hint not found in map");
         }
         SkipList::Node* hint_node = nullptr;
         hint_node = promote_to_node(hint_it->first, hint_it->second);
@@ -74,7 +77,10 @@ class RangeCacheShard : public CacheShardBase {
       } else {
         auto hint_it = map_.find(*hint);
         if (hint_it == map_.end()) {
-          throw std::runtime_error("Hint not found in map");
+          // cross-shard hint won't be able to find
+          put(key, value, std::nullopt);
+          return true;
+          // throw std::runtime_error("Hint not found in map");
         }
         // update previous node
         SkipList::Node* hint_node = nullptr;
@@ -151,6 +157,11 @@ class RangeCacheShard : public CacheShardBase {
   bool warmup_done() const override {
     std::lock_guard<std::mutex> lock(mutex_);
     return eviction_policy_->warmup_done();
+  }
+
+  std::optional<K> peek_victim() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return eviction_policy_->peek_victim();
   }
 
  private:

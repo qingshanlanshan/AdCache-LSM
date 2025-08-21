@@ -50,7 +50,7 @@ class LRU : public EvictionPolicy {
     return evicted;
   }
 
-  bool warmup_done() override {
+  bool warmup_done() const override {
     return pos_.size() >= capacity_;
   }
 
@@ -64,6 +64,11 @@ class LRU : public EvictionPolicy {
   bool contains(K key) const { return pos_.find(key) != pos_.end(); }
   size_t size() const { return pos_.size(); }
   size_t capacity() const { return capacity_; }
+
+  std::optional<K> peek_victim() const override {
+    if (pos_.size() < capacity_) return std::nullopt;
+    return order_.back();
+  }
 
  private:
   size_t capacity_;

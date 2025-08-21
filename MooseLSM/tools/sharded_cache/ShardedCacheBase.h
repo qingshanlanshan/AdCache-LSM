@@ -69,6 +69,11 @@ class ShardedCacheBase {
     return true;
   }
 
+  std::optional<K> peek_victim(K key) {
+    CacheShardBase* shard = find_shard(key);
+    return shard ? shard->peek_victim() : std::nullopt;
+  }
+
  private:
   std::map<K, std::shared_ptr<CacheShardBase>> shards_;
 

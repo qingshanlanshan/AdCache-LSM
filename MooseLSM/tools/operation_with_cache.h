@@ -44,15 +44,32 @@ rocksdb::Status get_with_cache(rocksdb::DB* db, std::optional<ShardedCacheBase> 
     // block cache, do nothing
   }
   else if (cache->name == "adcache") {
-    bool allowed = false;
-    {
+    bool allowed = true;
+    if (learning_stats.warmup_done && ENABLE_ADMISSION_CONTROL) {
+      allowed = false;
       // frequency-based admission control
       std::lock_guard<std::mutex> lock(adcache_helper.mutex);
       adcache_helper.frequency_map[key] += 1;
       adcache_helper.total_frequency += 1;
-      if (adcache_helper.frequency_map[key] >= threshold * adcache_helper.total_frequency) 
+
+      if (threshold < 0.2 && adcache_helper.frequency_map[key] >= threshold * adcache_helper.total_frequency) {
         allowed = true;
-      if (adcache_helper.frequency_map[key] > 8) {
+      }
+      else {
+        auto victim = cache->peek_victim(key);
+        if (victim) {
+          auto it = adcache_helper.frequency_map.find(*victim);
+          if (it == adcache_helper.frequency_map.end() ||
+              it->second < adcache_helper.frequency_map[key]) {
+            allowed = true;
+          }
+        }
+        else {
+          allowed = true;
+        }
+      }
+      
+      if (adcache_helper.frequency_map[key] > 16) {
         allowed = true;
         for (auto& pair : adcache_helper.frequency_map) {
           pair.second /= 2;
@@ -64,7 +81,7 @@ rocksdb::Status get_with_cache(rocksdb::DB* db, std::optional<ShardedCacheBase> 
     }
   }
   else {
-   cache->put(key, value);
+    cache->put(key, value);
   }
 
   auto duration = chrono::duration_cast<chrono::microseconds>(chrono::steady_clock::now() - start).count();
@@ -95,7 +112,7 @@ rocksdb::Status put_with_cache(rocksdb::DB* db, std::optional<ShardedCacheBase> 
 }
 
 rocksdb::Status scan_with_cache(rocksdb::DB* db, std::optional<ShardedCacheBase> cache,
-                                const std::string& key_string, size_t length, size_t cache_limit) {
+                                const std::string& key_string, size_t length, size_t cache_limit, rocksdb::ReadOptions& read_options) {
   size_t key = std::stoull(key_string);
   stats.OP_count++;
   stats.n_scan++;
@@ -123,7 +140,12 @@ rocksdb::Status scan_with_cache(rocksdb::DB* db, std::optional<ShardedCacheBase>
 
   std::string scan_key = ItoaWithPadding(key, 16);
   auto start = chrono::steady_clock::now();
-  auto iter = db->NewIterator(rocksdb::ReadOptions());
+  rocksdb::Iterator* iter;
+  if (ENABLE_ADMISSION_CONTROL)
+    iter = db->NewIterator(read_options);
+  else {
+    iter = db->NewIterator(rocksdb::ReadOptions());
+  }
   iter->Seek(scan_key);
   for (size_t i = 0; i < length - count; ++i, ++key, iter->Next()) {
     if (!iter->Valid()) break;

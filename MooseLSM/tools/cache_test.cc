@@ -43,7 +43,6 @@ std::mt19937 gen(rd());
 size_t max_possible_scan_len = 64;
 K min_key = 0;
 K max_key = 1e8;
-size_t num_keys = 0;
 size_t num_levels = 0;
 auto launch_time = chrono::steady_clock::now();
 
@@ -342,7 +341,7 @@ void FileWorkload(rocksdb::DB* db, std::optional<ShardedCacheBase>& cache, std::
       throw std::runtime_error("Delete operation is not implemented yet.");
     } else if (op.type == SCAN) {
       size_t cache_length = op.length;
-      if (FLAGS_cache_style == "adcache") {
+      if (FLAGS_cache_style == "adcache" && ENABLE_ADMISSION_CONTROL) {
         std::shared_lock<std::shared_mutex> lock(vector_mutex);
         auto i = params_scan_idx(op.key);
         auto a = cache_params_vector[i];
@@ -355,12 +354,10 @@ void FileWorkload(rocksdb::DB* db, std::optional<ShardedCacheBase>& cache, std::
           cache_length -= a;
           cache_length *= b; 
           cache_length += a;
-        } else {
-          cache_length = max_possible_scan_len;
         }
       }
 
-      scan_with_cache(db, cache, op.key, op.length, cache_length);
+      scan_with_cache(db, cache, op.key, op.length, cache_length, read_options);
       learning_stats.scan(op.key, op.length);
     }
 
@@ -398,7 +395,7 @@ void set_table_options(rocksdb::Options& options) {
     table_options->block_cache = block_cache;
     options.extern_options->block_cache = block_cache;
   }
-  else if (FLAGS_cache_style == "adcache")
+  else if (FLAGS_cache_style == "adcache"&&false)
   {
     auto block_cache = rocksdb::NewLRUCache((size_t)FLAGS_cache_size * FLAGS_kvsize / 2, shard_bits);
     table_options->block_cache = block_cache;
@@ -489,9 +486,8 @@ int main(int argc, char** argv) {
     options = get_default_options();
   }
 
-  if (FLAGS_workload == "test") {
-    // options.use_direct_io_for_flush_and_compaction = true;
-    // options.use_direct_reads = true;
+  if (FLAGS_workload == "test" && ENABLE_DIRECTIO) {
+    options.use_direct_reads = true;
   }
   options.statistics = rocksdb::CreateDBStatistics();
   options.advise_random_on_open = false;
@@ -503,18 +499,12 @@ int main(int argc, char** argv) {
     std::cerr << "Failed to open db: " << status.ToString() << std::endl;
     return 1;
   }
-  // estimate db size
-  db->GetIntProperty(rocksdb::DB::Properties::kEstimateNumKeys, &num_keys);
-  num_keys /= 1.1;
-  max_key = num_keys;
-  std::cout << "num_keys: " << num_keys 
-            << " max_key: " << max_key << std::endl;
 
   int cache_capacity = 0;
   if (FLAGS_workload == "test" && FLAGS_cache_size > 0) {
     cache_capacity = FLAGS_cache_size;
-    if (FLAGS_cache_style == "adcache") 
-      cache_capacity /= 2;
+    // if (FLAGS_cache_style == "adcache") 
+    //   cache_capacity /= 2;
   }
   std::cout << "Cache params:\n"
             << "\tmin_key: " << min_key << "\n"
@@ -538,8 +528,8 @@ int main(int argc, char** argv) {
     // PrepareDB_ingestion(db, options);
   } else if (FLAGS_workload == "test") {
     if (FLAGS_cache_style == "adcache") {
-      learning_stats.cache_to_db_ratio = (float)cache_capacity / num_keys;
-      std::thread trainworker(train_worker_function, db, cache_capacity, FLAGS_kvsize, std::ref(cache), &out);
+      learning_stats.cache_to_db_ratio = (float)cache_capacity / (max_key - min_key);
+      std::thread trainworker(train_worker_function, db, FLAGS_cache_size, FLAGS_kvsize, std::ref(cache), &out);
       start_test_workers(db, std::ref(cache), &out);
       exit_train_worker.store(true);
       sem.trigger();  // Release in case the worker is waiting.
